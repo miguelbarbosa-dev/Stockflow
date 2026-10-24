@@ -1,13 +1,36 @@
 import sqlite3
+import hashlib
+import hmac
 from datetime import datetime
-import streamlit as st
+
 import pandas as pd
+import streamlit as st
 
 DB_NAME = "estoque.db"
+
+# Credenciais iniciais para demonstração acadêmica.
+# Altere a senha após o primeiro acesso se for adaptar o projeto.
+USUARIO_INICIAL = "admin"
+SENHA_INICIAL = "Estoque@123"
 
 
 def conectar():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+def gerar_hash_senha(senha, salt=None):
+    """Gera hash da senha com salt usando PBKDF2."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    hash_senha = hashlib.pbkdf2_hmac(
+        "sha256", senha.encode("utf-8"), salt.encode("utf-8"), 200_000
+    ).hex()
+    return salt, hash_senha
+
+
+def verificar_senha(senha, salt, hash_armazenado):
+    _, hash_digitado = gerar_hash_senha(senha, salt)
+    return hmac.compare_digest(hash_digitado, hash_armazenado)
 
 
 def criar_tabela():
@@ -31,6 +54,44 @@ def criar_tabela():
                 FOREIGN KEY(produto_id) REFERENCES produtos(id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT NOT NULL UNIQUE,
+                salt TEXT NOT NULL,
+                senha_hash TEXT NOT NULL,
+                criado_em TEXT NOT NULL
+            )
+        """)
+
+        # Cria a conta inicial somente se ainda não existir nenhum usuário.
+        usuario_existente = conn.execute(
+            "SELECT id FROM usuarios WHERE login = ?", (USUARIO_INICIAL,)
+        ).fetchone()
+        if usuario_existente is None:
+            salt, senha_hash = gerar_hash_senha(SENHA_INICIAL)
+            conn.execute(
+                "INSERT INTO usuarios (login, salt, senha_hash, criado_em) VALUES (?, ?, ?, ?)",
+                (
+                    USUARIO_INICIAL,
+                    salt,
+                    senha_hash,
+                    datetime.now().strftime("%d/%m/%Y %H:%M"),
+                ),
+            )
+
+
+def autenticar(login, senha):
+    with conectar() as conn:
+        usuario = conn.execute(
+            "SELECT salt, senha_hash FROM usuarios WHERE login = ?",
+            (login.strip(),),
+        ).fetchone()
+
+    if usuario is None:
+        return False
+    salt, senha_hash = usuario
+    return verificar_senha(senha, salt, senha_hash)
 
 
 def listar_produtos():
@@ -102,8 +163,38 @@ def movimentar_estoque(produto_id, tipo, quantidade):
     return True, f"{tipo} registrada com sucesso."
 
 
+def tela_login():
+    st.title("🔐 Login do Sistema")
+    st.write("Entre com seu usuário e senha para acessar o controle de estoque.")
+
+    with st.form("form_login"):
+        login = st.text_input("Login")
+        senha = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+
+    if entrar:
+        if autenticar(login, senha):
+            st.session_state["autenticado"] = True
+            st.session_state["usuario"] = login.strip()
+            st.rerun()
+        else:
+            st.error("Login ou senha incorretos.")
+
+
 st.set_page_config(page_title="Controle de Estoque", page_icon="📦", layout="wide")
 criar_tabela()
+
+# Bloqueia todas as funcionalidades até o usuário autenticar.
+if not st.session_state.get("autenticado", False):
+    tela_login()
+    st.stop()
+
+with st.sidebar:
+    st.write(f"Usuário conectado: **{st.session_state.get('usuario', '')}**")
+    if st.button("Sair", use_container_width=True):
+        st.session_state["autenticado"] = False
+        st.session_state.pop("usuario", None)
+        st.rerun()
 
 st.title("📦 Controle de Produtos de Supermercado")
 st.caption("Projeto básico em Python, Streamlit e SQLite. Os dados ficam salvos localmente.")
