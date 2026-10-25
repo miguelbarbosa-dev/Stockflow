@@ -9,7 +9,7 @@ import streamlit as st
 
 DB_NAME = "estoque.db"
 
-# Credenciais iniciais para demonstração acadêmica.
+# Credenciais iniciais e ÚNICAS que nascem como administrador
 USUARIO_INICIAL = "admin"
 SENHA_INICIAL = "Estoque@123"
 
@@ -70,7 +70,8 @@ def criar_tabela():
         except sqlite3.OperationalError:
             pass  # Coluna já existe, ignora o erro
 
-        # Cria a conta inicial somente se ainda não existir nenhum usuário.
+        # Cria a conta inicial SOMENTE se ainda não existir nenhum usuário.
+        # Esta será a ÚNICA conta administrador por padrão.
         usuario_existente = conn.execute(
             "SELECT id FROM usuarios WHERE login = ?", (USUARIO_INICIAL,)
         ).fetchone()
@@ -82,7 +83,7 @@ def criar_tabela():
                     USUARIO_INICIAL,
                     salt,
                     senha_hash,
-                    'admin',  # Perfil de administrador
+                    'admin',  # Único admin inicial
                     datetime.now().strftime("%d/%m/%Y %H:%M"),
                 ),
             )
@@ -206,7 +207,6 @@ def excluir_usuario(usuario_id, usuario_logado_id):
         if int(usuario_id) == int(usuario_logado_id):
             return False, "Você não pode excluir sua própria conta."
         
-        # Verifica se é o último admin
         admins = conn.execute("SELECT id FROM usuarios WHERE perfil = 'admin'").fetchall()
         usuario_alvo = conn.execute("SELECT perfil FROM usuarios WHERE id = ?", (int(usuario_id),)).fetchone()
         
@@ -246,11 +246,12 @@ if not st.session_state.get("autenticado", False):
     tela_login()
     st.stop()
 
-# Sidebar
+# --- BARRA LATERAL (SIDEBAR) ---
 with st.sidebar:
+    # MOSTRA APENAS O QUE O USUÁRIO LOGADO É (Perfil)
     perfil_display = "Administrador" if st.session_state.get("perfil") == "admin" else "Funcionário"
-    st.write(f"👤 Usuário: **{st.session_state.get('usuario', '')}**")
-    st.write(f"🛡️ Perfil: **{perfil_display}**")
+    st.write(f"👤 Perfil atual: **{perfil_display}**")
+    
     st.divider()
     if st.button("Sair", use_container_width=True, type="secondary"):
         st.session_state["autenticado"] = False
@@ -430,7 +431,8 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
             with st.form("form_novo_usuario"):
                 novo_login = st.text_input("Login do novo usuário")
                 nova_senha = st.text_input("Senha inicial", type="password")
-                novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"])
+                # O padrão já é funcionário (index=0), reforçando que novos cadastros são funcionários comuns
+                novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"], index=0)
                 btn_criar = st.form_submit_button("Cadastrar Usuário", type="primary")
                 
                 if btn_criar:
@@ -464,7 +466,6 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                 with col1:
                     novo_perfil_select = st.selectbox("Alterar para o perfil", ["admin", "funcionario"], key="alterar_perfil")
                     if st.button("Salvar Alteração de Privilégio", type="secondary"):
-                        # Pega o perfil atual para não fazer update desnecessário
                         perfil_atual = usuarios_df[usuarios_df["id"] == usuario_id]["perfil"].iloc[0]
                         if novo_perfil_select != perfil_atual:
                             sucesso, msg = alterar_perfil_usuario(usuario_id, novo_perfil_select)
@@ -478,7 +479,6 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                     st.write(" ") # Espaçamento
                     st.write(" ")
                     if st.button("🗑️ Excluir este Usuário", type="primary"):
-                        # Precisamos do ID do usuário logado para evitar auto-exclusão
                         usuario_logado_id = conectar().execute(
                             "SELECT id FROM usuarios WHERE login = ?", (st.session_state.get("usuario"),)
                         ).fetchone()[0]
