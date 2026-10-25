@@ -1,6 +1,7 @@
 import sqlite3
 import hashlib
 import hmac
+import secrets  
 from datetime import datetime
 
 import pandas as pd
@@ -9,7 +10,6 @@ import streamlit as st
 DB_NAME = "estoque.db"
 
 # Credenciais iniciais para demonstração acadêmica.
-# Altere a senha após o primeiro acesso se for adaptar o projeto.
 USUARIO_INICIAL = "admin"
 SENHA_INICIAL = "Estoque@123"
 
@@ -19,7 +19,6 @@ def conectar():
 
 
 def gerar_hash_senha(senha, salt=None):
-    """Gera hash da senha com salt usando PBKDF2."""
     if salt is None:
         salt = secrets.token_hex(16)
     hash_senha = hashlib.pbkdf2_hmac(
@@ -60,9 +59,16 @@ def criar_tabela():
                 login TEXT NOT NULL UNIQUE,
                 salt TEXT NOT NULL,
                 senha_hash TEXT NOT NULL,
+                perfil TEXT NOT NULL DEFAULT 'funcionario',
                 criado_em TEXT NOT NULL
             )
         """)
+
+        # Migração para bancos de dados antigos que não têm a coluna 'perfil'
+        try:
+            conn.execute("ALTER TABLE usuarios ADD COLUMN perfil TEXT DEFAULT 'funcionario'")
+        except sqlite3.OperationalError:
+            pass  # Coluna já existe, ignora o erro
 
         # Cria a conta inicial somente se ainda não existir nenhum usuário.
         usuario_existente = conn.execute(
@@ -71,11 +77,12 @@ def criar_tabela():
         if usuario_existente is None:
             salt, senha_hash = gerar_hash_senha(SENHA_INICIAL)
             conn.execute(
-                "INSERT INTO usuarios (login, salt, senha_hash, criado_em) VALUES (?, ?, ?, ?)",
+                "INSERT INTO usuarios (login, salt, senha_hash, perfil, criado_em) VALUES (?, ?, ?, ?, ?)",
                 (
                     USUARIO_INICIAL,
                     salt,
                     senha_hash,
+                    'admin',  # Perfil de administrador
                     datetime.now().strftime("%d/%m/%Y %H:%M"),
                 ),
             )
@@ -84,14 +91,16 @@ def criar_tabela():
 def autenticar(login, senha):
     with conectar() as conn:
         usuario = conn.execute(
-            "SELECT salt, senha_hash FROM usuarios WHERE login = ?",
+            "SELECT salt, senha_hash, perfil FROM usuarios WHERE login = ?",
             (login.strip(),),
         ).fetchone()
 
     if usuario is None:
-        return False
-    salt, senha_hash = usuario
-    return verificar_senha(senha, salt, senha_hash)
+        return False, None
+    salt, senha_hash, perfil = usuario
+    if verificar_senha(senha, salt, senha_hash):
+        return True, perfil
+    return False, None
 
 
 def listar_produtos():
@@ -124,9 +133,9 @@ def excluir_produto(produto_id):
             "SELECT 1 FROM movimentacoes WHERE produto_id = ? LIMIT 1", (int(produto_id),)
         ).fetchone()
         if existe_movimentacao:
-            return False
+            return False, "Não é possível excluir: este produto já possui movimentações registradas."
         conn.execute("DELETE FROM produtos WHERE id = ?", (int(produto_id),))
-        return True
+        return True, "Produto excluído com sucesso."
 
 
 def movimentar_estoque(produto_id, tipo, quantidade):
@@ -163,6 +172,51 @@ def movimentar_estoque(produto_id, tipo, quantidade):
     return True, f"{tipo} registrada com sucesso."
 
 
+# --- Funções de Gerenciamento de Usuários (Apenas Admin) ---
+
+def listar_usuarios():
+    with conectar() as conn:
+        return pd.read_sql_query(
+            "SELECT id, login, perfil, criado_em FROM usuarios ORDER BY id",
+            conn
+        )
+
+def adicionar_usuario(novo_login, nova_senha, novo_perfil):
+    with conectar() as conn:
+        try:
+            salt, senha_hash = gerar_hash_senha(nova_senha)
+            conn.execute(
+                "INSERT INTO usuarios (login, salt, senha_hash, perfil, criado_em) VALUES (?, ?, ?, ?, ?)",
+                (novo_login.strip(), salt, senha_hash, novo_perfil, datetime.now().strftime("%d/%m/%Y %H:%M"))
+            )
+            return True, "Usuário cadastrado com sucesso."
+        except sqlite3.IntegrityError:
+            return False, "Já existe um usuário com este login."
+
+def alterar_perfil_usuario(usuario_id, novo_perfil):
+    with conectar() as conn:
+        conn.execute(
+            "UPDATE usuarios SET perfil = ? WHERE id = ?",
+            (novo_perfil, int(usuario_id))
+        )
+    return True, "Privilégio alterado com sucesso."
+
+def excluir_usuario(usuario_id, usuario_logado_id):
+    with conectar() as conn:
+        if int(usuario_id) == int(usuario_logado_id):
+            return False, "Você não pode excluir sua própria conta."
+        
+        # Verifica se é o último admin
+        admins = conn.execute("SELECT id FROM usuarios WHERE perfil = 'admin'").fetchall()
+        usuario_alvo = conn.execute("SELECT perfil FROM usuarios WHERE id = ?", (int(usuario_id),)).fetchone()
+        
+        if usuario_alvo and usuario_alvo[0] == 'admin' and len(admins) <= 1:
+            return False, "Não é possível excluir o último administrador do sistema."
+
+        conn.execute("DELETE FROM usuarios WHERE id = ?", (int(usuario_id),))
+        return True, "Usuário excluído com sucesso."
+
+
 def tela_login():
     st.title("🔐 Login do Sistema")
     st.write("Entre com seu usuário e senha para acessar o controle de estoque.")
@@ -173,14 +227,17 @@ def tela_login():
         entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
     if entrar:
-        if autenticar(login, senha):
+        sucesso, perfil = autenticar(login, senha)
+        if sucesso:
             st.session_state["autenticado"] = True
             st.session_state["usuario"] = login.strip()
+            st.session_state["perfil"] = perfil
             st.rerun()
         else:
             st.error("Login ou senha incorretos.")
 
 
+# --- Configuração da Página ---
 st.set_page_config(page_title="Controle de Estoque", page_icon="📦", layout="wide")
 criar_tabela()
 
@@ -189,11 +246,16 @@ if not st.session_state.get("autenticado", False):
     tela_login()
     st.stop()
 
+# Sidebar
 with st.sidebar:
-    st.write(f"Usuário conectado: **{st.session_state.get('usuario', '')}**")
-    if st.button("Sair", use_container_width=True):
+    perfil_display = "Administrador" if st.session_state.get("perfil") == "admin" else "Funcionário"
+    st.write(f"👤 Usuário: **{st.session_state.get('usuario', '')}**")
+    st.write(f"🛡️ Perfil: **{perfil_display}**")
+    st.divider()
+    if st.button("Sair", use_container_width=True, type="secondary"):
         st.session_state["autenticado"] = False
         st.session_state.pop("usuario", None)
+        st.session_state.pop("perfil", None)
         st.rerun()
 
 st.title("📦 Controle de Produtos de Supermercado")
@@ -209,10 +271,14 @@ c1.metric("Produtos cadastrados", total_produtos)
 c2.metric("Unidades em estoque", unidades_estoque)
 c3.metric("Valor estimado do estoque", f"R$ {valor_estoque:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
-aba_produtos, aba_movimentacoes, aba_consulta = st.tabs(
-    ["Cadastrar / editar produtos", "Entrada e saída", "Consultar estoque"]
-)
+# Definição das abas (Adiciona aba de usuários apenas se for admin)
+abas = ["Cadastrar / editar produtos", "Entrada e saída", "Consultar estoque"]
+if st.session_state.get("perfil") == "admin":
+    abas.append("🛡️ Gerenciar Usuários")
 
+aba_produtos, aba_movimentacoes, aba_consulta, *aba_usuarios = st.tabs(abas)
+
+# --- ABA PRODUTOS ---
 with aba_produtos:
     st.subheader("Cadastrar produto")
     with st.form("form_cadastro", clear_on_submit=True):
@@ -264,13 +330,19 @@ with aba_produtos:
                     st.success("Produto atualizado.")
                     st.rerun()
 
-        if st.button("Excluir produto selecionado", key="excluir_produto"):
-            if excluir_produto(produto_id):
-                st.success("Produto excluído.")
-                st.rerun()
-            else:
-                st.error("Não é possível excluir: este produto já possui movimentações registradas.")
+        # RESTRIÇÃO DE EXCLUSÃO: Apenas Admin
+        if st.session_state.get("perfil") == "admin":
+            if st.button("🗑️ Excluir produto selecionado", key="excluir_produto", type="secondary"):
+                sucesso, msg = excluir_produto(produto_id)
+                if sucesso:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            st.info("🔒 Apenas administradores podem excluir produtos.")
 
+# --- ABA MOVIMENTAÇÕES ---
 with aba_movimentacoes:
     st.subheader("Registrar entrada ou saída")
     produtos = listar_produtos()
@@ -309,6 +381,7 @@ with aba_movimentacoes:
     else:
         st.dataframe(historico, use_container_width=True, hide_index=True)
 
+# --- ABA CONSULTA ---
 with aba_consulta:
     st.subheader("Produtos cadastrados")
     produtos = listar_produtos()
@@ -319,14 +392,14 @@ with aba_consulta:
         if busca.strip():
             produtos = produtos[produtos["nome"].str.contains(busca.strip(), case=False, na=False)]
 
-        produtos = produtos.rename(columns={
+        produtos_display = produtos.rename(columns={
             "id": "ID",
             "nome": "Produto",
             "preco": "Preço (R$)",
             "quantidade": "Quantidade"
         })
         st.dataframe(
-            produtos,
+            produtos_display,
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -338,9 +411,81 @@ with aba_consulta:
         st.divider()
         st.subheader("Estoque baixo")
         limite = st.number_input("Considerar estoque baixo quando houver até", min_value=0, value=5, step=1)
-        estoque_baixo = produtos[produtos["Quantidade"] <= limite]
+        estoque_baixo = produtos_display[produtos_display["Quantidade"] <= limite]
         if estoque_baixo.empty:
             st.success("Nenhum produto abaixo do limite escolhido.")
         else:
             st.warning(f"{len(estoque_baixo)} produto(s) com estoque baixo.")
             st.dataframe(estoque_baixo, use_container_width=True, hide_index=True)
+
+# --- ABA GERENCIAR USUÁRIOS (APENAS ADMIN) ---
+if st.session_state.get("perfil") == "admin" and aba_usuarios:
+    with aba_usuarios[0]:
+        st.subheader("🛡️ Gerenciamento de Usuários e Privilégios")
+        st.info("Apenas administradores têm acesso a esta aba.")
+        
+        tab_criar, tab_gerenciar = st.tabs(["Cadastrar Novo Usuário", "Alterar Privilégios / Excluir"])
+        
+        with tab_criar:
+            with st.form("form_novo_usuario"):
+                novo_login = st.text_input("Login do novo usuário")
+                nova_senha = st.text_input("Senha inicial", type="password")
+                novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"])
+                btn_criar = st.form_submit_button("Cadastrar Usuário", type="primary")
+                
+                if btn_criar:
+                    if not novo_login.strip() or not nova_senha.strip():
+                        st.error("Preencha todos os campos.")
+                    else:
+                        sucesso, msg = adicionar_usuario(novo_login, nova_senha, novo_perfil)
+                        if sucesso:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        with tab_gerenciar:
+            usuarios_df = listar_usuarios()
+            if usuarios_df.empty:
+                st.warning("Nenhum usuário encontrado.")
+            else:
+                st.dataframe(usuarios_df, use_container_width=True, hide_index=True)
+                
+                st.divider()
+                st.write("### Modificar Usuário Existente")
+                opcoes_usuarios = {
+                    f'{row["login"]} (Perfil: {row["perfil"]})': int(row["id"])
+                    for _, row in usuarios_df.iterrows()
+                }
+                usuario_selecionado_nome = st.selectbox("Selecione o usuário", list(opcoes_usuarios.keys()))
+                usuario_id = opcoes_usuarios[usuario_selecionado_nome]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    novo_perfil_select = st.selectbox("Alterar para o perfil", ["admin", "funcionario"], key="alterar_perfil")
+                    if st.button("Salvar Alteração de Privilégio", type="secondary"):
+                        # Pega o perfil atual para não fazer update desnecessário
+                        perfil_atual = usuarios_df[usuarios_df["id"] == usuario_id]["perfil"].iloc[0]
+                        if novo_perfil_select != perfil_atual:
+                            sucesso, msg = alterar_perfil_usuario(usuario_id, novo_perfil_select)
+                            if sucesso:
+                                st.success(msg)
+                                st.rerun()
+                        else:
+                            st.info("O usuário já possui este perfil.")
+
+                with col2:
+                    st.write(" ") # Espaçamento
+                    st.write(" ")
+                    if st.button("🗑️ Excluir este Usuário", type="primary"):
+                        # Precisamos do ID do usuário logado para evitar auto-exclusão
+                        usuario_logado_id = conectar().execute(
+                            "SELECT id FROM usuarios WHERE login = ?", (st.session_state.get("usuario"),)
+                        ).fetchone()[0]
+                        
+                        sucesso, msg = excluir_usuario(usuario_id, usuario_logado_id)
+                        if sucesso:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
