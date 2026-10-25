@@ -71,7 +71,6 @@ def criar_tabela():
             pass  # Coluna já existe, ignora o erro
 
         # Cria a conta inicial SOMENTE se ainda não existir nenhum usuário.
-        # Esta será a ÚNICA conta administrador por padrão.
         usuario_existente = conn.execute(
             "SELECT id FROM usuarios WHERE login = ?", (USUARIO_INICIAL,)
         ).fetchone()
@@ -83,7 +82,7 @@ def criar_tabela():
                     USUARIO_INICIAL,
                     salt,
                     senha_hash,
-                    'admin',  # Único admin inicial
+                    'admin',
                     datetime.now().strftime("%d/%m/%Y %H:%M"),
                 ),
             )
@@ -218,8 +217,8 @@ def excluir_usuario(usuario_id, usuario_logado_id):
 
 
 def tela_login():
-    st.title("🔐 Login do Sistema")
-    st.write("Entre com seu usuário e senha para acessar o controle de estoque.")
+    st.markdown('<h1 class="main-title">StockFlow</h1>', unsafe_allow_html=True)
+    st.write("Entre com seu usuário e senha para acessar o sistema.")
 
     with st.form("form_login"):
         login = st.text_input("Login")
@@ -238,7 +237,42 @@ def tela_login():
 
 
 # --- Configuração da Página ---
-st.set_page_config(page_title="Controle de Estoque", page_icon="📦", layout="wide")
+# 1. Nome alterado para StockFlow e emoji da aba removido (usando "SF")
+st.set_page_config(page_title="StockFlow", page_icon="SF", layout="wide")
+
+# 2. CSS Personalizado para melhorar o CONTRASTE e a estética
+st.markdown("""
+    <style>
+    /* Título principal com alto contraste e borda inferior */
+    .main-title {
+        font-size: 2.5rem !important;
+        font-weight: 800 !important;
+        color: #0F172A !important; /* Azul muito escuro/quase preto */
+        border-bottom: 3px solid #2563EB; /* Linha azul vibrante */
+        padding-bottom: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    /* Melhora o contraste e destaque dos cards de métrica */
+    [data-testid="stMetric"] {
+        background-color: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-radius: 8px;
+        padding: 15px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    /* Garante que o texto geral tenha alto contraste (cinza muito escuro) */
+    .stApp {
+        color: #1E293B;
+    }
+    /* Destaque para subtítulos */
+    .stSubheader {
+        color: #334155;
+        font-weight: 600;
+        margin-top: 1.5rem;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 criar_tabela()
 
 # Bloqueia todas as funcionalidades até o usuário autenticar.
@@ -248,9 +282,9 @@ if not st.session_state.get("autenticado", False):
 
 # --- BARRA LATERAL (SIDEBAR) ---
 with st.sidebar:
-    # MOSTRA APENAS O QUE O USUÁRIO LOGADO É (Perfil)
+    st.markdown("### StockFlow")
     perfil_display = "Administrador" if st.session_state.get("perfil") == "admin" else "Funcionário"
-    st.write(f"👤 Perfil atual: **{perfil_display}**")
+    st.write(f"👤 Perfil: **{perfil_display}**")
     
     st.divider()
     if st.button("Sair", use_container_width=True, type="secondary"):
@@ -259,8 +293,9 @@ with st.sidebar:
         st.session_state.pop("perfil", None)
         st.rerun()
 
-st.title("📦 Controle de Produtos de Supermercado")
-st.caption("Projeto básico em Python, Streamlit e SQLite. Os dados ficam salvos localmente.")
+# 3. Título posicionado no topo da área principal, com alto contraste
+st.markdown('<h1 class="main-title">StockFlow</h1>', unsafe_allow_html=True)
+st.caption("Sistema moderno e eficiente para gestão de estoque.")
 
 produtos = listar_produtos()
 total_produtos = len(produtos)
@@ -272,8 +307,8 @@ c1.metric("Produtos cadastrados", total_produtos)
 c2.metric("Unidades em estoque", unidades_estoque)
 c3.metric("Valor estimado do estoque", f"R$ {valor_estoque:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
-# Definição das abas (Adiciona aba de usuários apenas se for admin)
-abas = ["Cadastrar / editar produtos", "Entrada e saída", "Consultar estoque"]
+# Definição das abas
+abas = ["Cadastrar / Editar Produtos", "Entrada e Saída", "Consultar Estoque"]
 if st.session_state.get("perfil") == "admin":
     abas.append("🛡️ Gerenciar Usuários")
 
@@ -431,7 +466,6 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
             with st.form("form_novo_usuario"):
                 novo_login = st.text_input("Login do novo usuário")
                 nova_senha = st.text_input("Senha inicial", type="password")
-                # O padrão já é funcionário (index=0), reforçando que novos cadastros são funcionários comuns
                 novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"], index=0)
                 btn_criar = st.form_submit_button("Cadastrar Usuário", type="primary")
                 
@@ -476,7 +510,7 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                             st.info("O usuário já possui este perfil.")
 
                 with col2:
-                    st.write(" ") # Espaçamento
+                    st.write(" ") 
                     st.write(" ")
                     if st.button("🗑️ Excluir este Usuário", type="primary"):
                         usuario_logado_id = conectar().execute(
