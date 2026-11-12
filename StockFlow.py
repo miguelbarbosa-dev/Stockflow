@@ -1,22 +1,38 @@
-import sqlite3
 import hashlib
 import hmac
-import secrets  
-from datetime import datetime
+import json
+import re
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 
 DB_NAME = "estoque.db"
+LIMITE_MIN = date(2000, 1, 1)
+LIMITE_MAX = date(2100, 12, 31)
 
 # Credenciais iniciais e ÚNICAS que nascem como administrador
 USUARIO_INICIAL = "admin"
 SENHA_INICIAL = "Estoque@123"
 
 
+@contextmanager
 def conectar():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
+    """Conexão curta: confirma (commit) ao sair e SEMPRE fecha, evitando conexões vazando."""
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def gerar_hash_senha(senha, salt=None):
@@ -35,13 +51,18 @@ def verificar_senha(senha, salt, hash_armazenado):
 
 def criar_tabela():
     with conectar() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")  # leituras e escritas não se bloqueiam
         conn.execute("""
             CREATE TABLE IF NOT EXISTS produtos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT NOT NULL,
                 preco REAL NOT NULL CHECK(preco >= 0),
                 quantidade INTEGER NOT NULL CHECK(quantidade >= 0),
-                criado_em TEXT NOT NULL
+                criado_em TEXT NOT NULL,
+                ncm TEXT,
+                lote TEXT,
+                fabricacao TEXT,
+                validade TEXT
             )
         """)
         conn.execute("""
@@ -65,13 +86,21 @@ def criar_tabela():
             )
         """)
 
-        # Migração para bancos de dados antigos que não têm a coluna 'perfil'
-        try:
-            conn.execute("ALTER TABLE usuarios ADD COLUMN perfil TEXT DEFAULT 'funcionario'")
-        except sqlite3.OperationalError:
-            pass  # Coluna já existe, ignora o erro
+        # Migrações para bancos antigos: só adiciona o que ainda não existe
+        def colunas(tabela):
+            return {linha[1] for linha in conn.execute(f"PRAGMA table_info({tabela})")}
 
-        # Cria a conta inicial SOMENTE se ainda não existir nenhum usuário.
+        if "perfil" not in colunas("usuarios"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN perfil TEXT DEFAULT 'funcionario'")
+        existentes = colunas("produtos")
+        for coluna in ("ncm", "lote", "fabricacao", "validade"):
+            if coluna not in existentes:
+                conn.execute(f"ALTER TABLE produtos ADD COLUMN {coluna} TEXT")
+
+        # Índice que acelera a verificação de exclusão e o histórico
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mov_produto ON movimentacoes(produto_id)")
+
+        # Cria a conta inicial SOMENTE se ainda não existir.
         usuario_existente = conn.execute(
             "SELECT id FROM usuarios WHERE login = ?", (USUARIO_INICIAL,)
         ).fetchone()
@@ -79,14 +108,19 @@ def criar_tabela():
             salt, senha_hash = gerar_hash_senha(SENHA_INICIAL)
             conn.execute(
                 "INSERT INTO usuarios (login, salt, senha_hash, perfil, criado_em) VALUES (?, ?, ?, ?, ?)",
-                (
-                    USUARIO_INICIAL,
-                    salt,
-                    senha_hash,
-                    'admin',
-                    datetime.now().strftime("%d/%m/%Y %H:%M"),
-                ),
+                (USUARIO_INICIAL, salt, senha_hash, 'admin', agora()),
             )
+
+
+@st.cache_resource(show_spinner=False)
+def inicializar_banco():
+    """Prepara o banco uma única vez por processo (e não a cada interação na tela)."""
+    criar_tabela()
+    return True
+
+
+def agora():
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
 
 
 def autenticar(login, senha):
@@ -104,28 +138,167 @@ def autenticar(login, senha):
     return False, None
 
 
+# ---------------------------------------------------------------------
+# NCM (Nomenclatura Comum do Mercosul)
+# ---------------------------------------------------------------------
+ARQUIVO_TABELA_NCM = "ncm_tabela.csv"  # opcional; também aceita ncm_tabela.json
+
+
+def normalizar_ncm(valor):
+    """Mantém só os dígitos ('2106.90.90' -> '21069090')."""
+    if valor is None or pd.isna(valor):
+        return ""
+    return re.sub(r"\D", "", str(valor))
+
+
+def formatar_ncm(valor):
+    n = normalizar_ncm(valor)
+    return f"{n[:4]}.{n[4:6]}.{n[6:]}" if len(n) == 8 else n
+
+
+@st.cache_data(show_spinner=False)
+def carregar_tabela_ncm():
+    """Tabela oficial (opcional): dict {codigo_8_digitos: descricao}. Vazio se não houver arquivo."""
+    base = Path(__file__).resolve().parent
+    tabela = {}
+    try:
+        csv_path, json_path = base / ARQUIVO_TABELA_NCM, base / "ncm_tabela.json"
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, sep=None, engine="python", dtype=str, encoding_errors="replace")
+            registros = df.to_dict("records")
+        elif json_path.exists():
+            dados = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(dados, dict):
+                dados = next((v for v in dados.values() if isinstance(v, list)), [])
+            registros = dados
+        else:
+            return tabela
+        for reg in registros:
+            chaves = {str(k).lower(): v for k, v in reg.items()}
+            cod = next((v for k, v in chaves.items() if k.startswith(("cod", "ncm"))), "")
+            desc = next((v for k, v in chaves.items() if k.startswith("desc")), "")
+            cod = normalizar_ncm(cod)
+            if len(cod) == 8:
+                tabela[cod] = str(desc)
+    except Exception:
+        return {}
+    return tabela
+
+
+def validar_ncm(valor):
+    """Retorna (ok, mensagem, descricao). Valida formato e, se houver tabela, a existência."""
+    n = normalizar_ncm(valor)
+    if len(n) != 8:
+        return False, "O NCM deve ter 8 dígitos (ex.: 2106.90.90).", None
+    capitulo = int(n[:2])
+    if capitulo == 0 or capitulo > 97 or capitulo == 77:
+        return False, f"NCM inválido: o capítulo {n[:2]} não existe na nomenclatura.", None
+    if n[2:4] == "00":
+        return False, "NCM inválido: a posição (3º e 4º dígitos) não pode ser 00.", None
+    tabela = carregar_tabela_ncm()
+    if tabela:
+        if n not in tabela:
+            return False, "NCM não consta na tabela oficial carregada.", None
+        return True, "NCM válido e encontrado na tabela oficial.", tabela[n]
+    return True, "Formato válido (tabela oficial não carregada; confira no Siscomex).", None
+
+
+# ---------------------------------------------------------------------
+# Datas e validações de produto
+# ---------------------------------------------------------------------
+def para_data(valor):
+    try:
+        return date.fromisoformat(valor) if isinstance(valor, str) and valor else None
+    except ValueError:
+        return None
+
+
+def validar_campos_produto(ncm, fabricacao, validade):
+    """Retorna a mensagem de erro ou None se estiver tudo certo."""
+    if normalizar_ncm(ncm) or str(ncm or "").strip():
+        ok, msg, _ = validar_ncm(ncm)
+        if not ok:
+            return msg
+    if fabricacao and fabricacao > date.today():
+        return "A data de fabricação não pode ser futura."
+    if fabricacao and validade and validade < fabricacao:
+        return "A validade não pode ser anterior à fabricação."
+    return None
+
+
+def _formatar_datas(serie):
+    return pd.to_datetime(serie, errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+
+
+def rotulo_validade(dias):
+    if pd.isna(dias):
+        return "Sem validade"
+    if dias < 0:
+        return "Vencido"
+    if dias == 0:
+        return "Vence hoje"
+    return f"Vence em {int(dias)} dia(s)"
+
+
+# ---------------------------------------------------------------------
+# Produtos e movimentações (leituras em cache; escritas limpam o cache)
+# ---------------------------------------------------------------------
+def _limpar_cache_estoque():
+    listar_produtos.clear()
+    listar_historico.clear()
+
+
+@st.cache_data(show_spinner=False)
 def listar_produtos():
     with conectar() as conn:
         return pd.read_sql_query(
-            "SELECT id, nome, preco, quantidade FROM produtos ORDER BY nome",
+            "SELECT id, nome, preco, quantidade, ncm, lote, fabricacao, validade "
+            "FROM produtos ORDER BY nome",
             conn
         )
 
 
-def adicionar_produto(nome, preco, quantidade):
+@st.cache_data(show_spinner=False)
+def listar_historico():
     with conectar() as conn:
-        conn.execute(
-            "INSERT INTO produtos (nome, preco, quantidade, criado_em) VALUES (?, ?, ?, ?)",
-            (nome.strip(), float(preco), int(quantidade), datetime.now().strftime("%d/%m/%Y %H:%M"))
-        )
+        return pd.read_sql_query("""
+            SELECT m.id, p.nome AS produto, p.lote, m.tipo, m.quantidade, m.data
+            FROM movimentacoes m
+            JOIN produtos p ON p.id = m.produto_id
+            ORDER BY m.id DESC
+            LIMIT 100
+        """, conn)
 
 
-def editar_produto(produto_id, nome, preco, quantidade):
+def _campos_extras(ncm, lote, fabricacao, validade):
+    return (
+        normalizar_ncm(ncm) or None,
+        (lote or "").strip() or None,
+        fabricacao.isoformat() if fabricacao else None,
+        validade.isoformat() if validade else None,
+    )
+
+
+def adicionar_produto(nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None):
     with conectar() as conn:
         conn.execute(
-            "UPDATE produtos SET nome = ?, preco = ?, quantidade = ? WHERE id = ?",
-            (nome.strip(), float(preco), int(quantidade), int(produto_id))
+            "INSERT INTO produtos (nome, preco, quantidade, criado_em, ncm, lote, fabricacao, validade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (nome.strip(), float(preco), int(quantidade), agora(),
+             *_campos_extras(ncm, lote, fabricacao, validade))
         )
+    _limpar_cache_estoque()
+
+
+def editar_produto(produto_id, nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None):
+    with conectar() as conn:
+        conn.execute(
+            "UPDATE produtos SET nome = ?, preco = ?, quantidade = ?, "
+            "ncm = ?, lote = ?, fabricacao = ?, validade = ? WHERE id = ?",
+            (nome.strip(), float(preco), int(quantidade),
+             *_campos_extras(ncm, lote, fabricacao, validade), int(produto_id))
+        )
+    _limpar_cache_estoque()
 
 
 def excluir_produto(produto_id):
@@ -136,51 +309,53 @@ def excluir_produto(produto_id):
         if existe_movimentacao:
             return False, "Não é possível excluir: este produto já possui movimentações registradas."
         conn.execute("DELETE FROM produtos WHERE id = ?", (int(produto_id),))
-        return True, "Produto excluído com sucesso."
+    _limpar_cache_estoque()
+    return True, "Produto excluído com sucesso."
 
 
 def movimentar_estoque(produto_id, tipo, quantidade):
-    quantidade = int(quantidade)
+    quantidade, produto_id = int(quantidade), int(produto_id)
     if quantidade <= 0:
         return False, "A quantidade deve ser maior que zero."
 
     with conectar() as conn:
-        produto = conn.execute(
-            "SELECT quantidade FROM produtos WHERE id = ?", (int(produto_id),)
-        ).fetchone()
-
-        if produto is None:
-            return False, "Produto não encontrado."
-
-        estoque_atual = int(produto[0])
-
-        if tipo == "Saída" and quantidade > estoque_atual:
-            return False, f"Estoque insuficiente. Disponível: {estoque_atual}."
-
+        # Uma única instrução atômica: evita corrida entre dois usuários ao mesmo tempo
         if tipo == "Entrada":
-            novo_estoque = estoque_atual + quantidade
+            cur = conn.execute(
+                "UPDATE produtos SET quantidade = quantidade + ? WHERE id = ?",
+                (quantidade, produto_id))
         else:
-            novo_estoque = estoque_atual - quantidade
-
-        conn.execute(
-            "UPDATE produtos SET quantidade = ? WHERE id = ?",
-            (novo_estoque, int(produto_id))
-        )
+            cur = conn.execute(
+                "UPDATE produtos SET quantidade = quantidade - ? WHERE id = ? AND quantidade >= ?",
+                (quantidade, produto_id, quantidade))
+        if cur.rowcount == 0:
+            produto = conn.execute(
+                "SELECT quantidade FROM produtos WHERE id = ?", (produto_id,)).fetchone()
+            if produto is None:
+                return False, "Produto não encontrado."
+            return False, f"Estoque insuficiente. Disponível: {int(produto[0])}."
         conn.execute(
             "INSERT INTO movimentacoes (produto_id, tipo, quantidade, data) VALUES (?, ?, ?, ?)",
-            (int(produto_id), tipo, quantidade, datetime.now().strftime("%d/%m/%Y %H:%M"))
+            (produto_id, tipo, quantidade, agora())
         )
+    _limpar_cache_estoque()
     return True, f"{tipo} registrada com sucesso."
 
 
 # --- Funções de Gerenciamento de Usuários (Apenas Admin) ---
 
+@st.cache_data(show_spinner=False)
 def listar_usuarios():
     with conectar() as conn:
         return pd.read_sql_query(
-            "SELECT id, login, perfil, criado_em FROM usuarios ORDER BY id",
-            conn
-        )
+            "SELECT id, login, perfil, criado_em FROM usuarios ORDER BY id", conn)
+
+
+def obter_id_usuario(login):
+    with conectar() as conn:
+        linha = conn.execute("SELECT id FROM usuarios WHERE login = ?", (login,)).fetchone()
+    return linha[0] if linha else None
+
 
 def adicionar_usuario(novo_login, nova_senha, novo_perfil):
     with conectar() as conn:
@@ -188,33 +363,36 @@ def adicionar_usuario(novo_login, nova_senha, novo_perfil):
             salt, senha_hash = gerar_hash_senha(nova_senha)
             conn.execute(
                 "INSERT INTO usuarios (login, salt, senha_hash, perfil, criado_em) VALUES (?, ?, ?, ?, ?)",
-                (novo_login.strip(), salt, senha_hash, novo_perfil, datetime.now().strftime("%d/%m/%Y %H:%M"))
+                (novo_login.strip(), salt, senha_hash, novo_perfil, agora())
             )
-            return True, "Usuário cadastrado com sucesso."
         except sqlite3.IntegrityError:
             return False, "Já existe um usuário com este login."
+    listar_usuarios.clear()
+    return True, "Usuário cadastrado com sucesso."
+
 
 def alterar_perfil_usuario(usuario_id, novo_perfil):
     with conectar() as conn:
-        conn.execute(
-            "UPDATE usuarios SET perfil = ? WHERE id = ?",
-            (novo_perfil, int(usuario_id))
-        )
+        conn.execute("UPDATE usuarios SET perfil = ? WHERE id = ?", (novo_perfil, int(usuario_id)))
+    listar_usuarios.clear()
     return True, "Privilégio alterado com sucesso."
+
 
 def excluir_usuario(usuario_id, usuario_logado_id):
     with conectar() as conn:
         if int(usuario_id) == int(usuario_logado_id):
             return False, "Você não pode excluir sua própria conta."
-        
+
         admins = conn.execute("SELECT id FROM usuarios WHERE perfil = 'admin'").fetchall()
-        usuario_alvo = conn.execute("SELECT perfil FROM usuarios WHERE id = ?", (int(usuario_id),)).fetchone()
-        
+        usuario_alvo = conn.execute(
+            "SELECT perfil FROM usuarios WHERE id = ?", (int(usuario_id),)).fetchone()
+
         if usuario_alvo and usuario_alvo[0] == 'admin' and len(admins) <= 1:
             return False, "Não é possível excluir o último administrador do sistema."
 
         conn.execute("DELETE FROM usuarios WHERE id = ?", (int(usuario_id),))
-        return True, "Usuário excluído com sucesso."
+    listar_usuarios.clear()
+    return True, "Usuário excluído com sucesso."
 
 
 def tela_login():
@@ -511,7 +689,7 @@ def seletor_tema():
 
 aplicar_tema()
 
-criar_tabela()
+inicializar_banco()
 
 # Bloqueia todas as funcionalidades até o usuário autenticar.
 if not st.session_state.get("autenticado", False):
@@ -560,18 +738,40 @@ aba_produtos, aba_movimentacoes, aba_consulta, *aba_usuarios = st.tabs(abas)
 # --- ABA PRODUTOS ---
 with aba_produtos:
     st.subheader("Cadastrar produto")
+
+    with st.expander("Validador de NCM"):
+        ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste", placeholder="Ex.: 2106.90.90")
+        if ncm_teste.strip():
+            ok_ncm, msg_ncm, desc_ncm = validar_ncm(ncm_teste)
+            if ok_ncm:
+                st.success(f"NCM {formatar_ncm(ncm_teste)} válido." + (f" {desc_ncm}" if desc_ncm else ""))
+                if not desc_ncm:
+                    st.caption(msg_ncm)
+            else:
+                st.error(msg_ncm)
+
     with st.form("form_cadastro", clear_on_submit=True):
         nome = st.text_input("Nome do produto")
         col1, col2 = st.columns(2)
         preco = col1.number_input("Preço (R$)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
         quantidade = col2.number_input("Quantidade inicial", min_value=0, value=0, step=1)
+        ncm = st.text_input("NCM", placeholder="0000.00.00", max_chars=10,
+                            help="8 dígitos, com ou sem pontos. Opcional, mas validado se preenchido.")
+        cl, cf, cv = st.columns(3)
+        lote = cl.text_input("Lote")
+        fabricacao = cf.date_input("Fabricação", value=None, min_value=LIMITE_MIN,
+                                   max_value=date.today(), format="DD/MM/YYYY")
+        validade = cv.date_input("Validade", value=None, min_value=LIMITE_MIN,
+                                 max_value=LIMITE_MAX, format="DD/MM/YYYY")
         enviado = st.form_submit_button("Cadastrar produto", type="primary")
 
         if enviado:
-            if not nome.strip():
-                st.error("Informe o nome do produto.")
+            erro = None if nome.strip() else "Informe o nome do produto."
+            erro = erro or validar_campos_produto(ncm, fabricacao, validade)
+            if erro:
+                st.error(erro)
             else:
-                adicionar_produto(nome, preco, quantidade)
+                adicionar_produto(nome, preco, quantidade, ncm, lote, fabricacao, validade)
                 st.success("Produto cadastrado com sucesso.")
                 st.rerun()
 
@@ -581,16 +781,13 @@ with aba_produtos:
     if produtos.empty:
         st.info("Cadastre um produto para poder editá-lo.")
     else:
-        opcoes = {
-            f'{row["id"]} - {row["nome"]}': int(row["id"])
-            for _, row in produtos.iterrows()
-        }
+        opcoes = {f"{i} - {n}": int(i) for i, n in zip(produtos["id"], produtos["nome"])}
         selecionado = st.selectbox("Selecione um produto", list(opcoes.keys()), key="produto_editar")
         produto_id = opcoes[selecionado]
         linha = produtos[produtos["id"] == produto_id].iloc[0]
 
         with st.form("form_edicao"):
-            nome_editado = st.text_input("Nome", value=str(linha["nome"]))
+            nome_editado = st.text_input("Nome", value=str(linha["nome"]), key=f"nome_{produto_id}")
             col1, col2 = st.columns(2)
             preco_editado = col1.number_input(
                 "Preço (R$)", min_value=0.0, value=float(linha["preco"]), step=0.5,
@@ -600,12 +797,26 @@ with aba_produtos:
                 "Quantidade", min_value=0, value=int(linha["quantidade"]), step=1,
                 key=f"quantidade_{produto_id}"
             )
+            ncm_editado = st.text_input(
+                "NCM", value=formatar_ncm(linha["ncm"]), max_chars=10, key=f"ncm_{produto_id}")
+            cl, cf, cv = st.columns(3)
+            lote_editado = cl.text_input(
+                "Lote", value="" if pd.isna(linha["lote"]) else str(linha["lote"]), key=f"lote_{produto_id}")
+            fab_editada = cf.date_input(
+                "Fabricação", value=para_data(linha["fabricacao"]), min_value=LIMITE_MIN,
+                max_value=date.today(), format="DD/MM/YYYY", key=f"fab_{produto_id}")
+            val_editada = cv.date_input(
+                "Validade", value=para_data(linha["validade"]), min_value=LIMITE_MIN,
+                max_value=LIMITE_MAX, format="DD/MM/YYYY", key=f"val_{produto_id}")
             salvar = st.form_submit_button("Salvar alterações")
             if salvar:
-                if not nome_editado.strip():
-                    st.error("O nome do produto é obrigatório.")
+                erro = None if nome_editado.strip() else "O nome do produto é obrigatório."
+                erro = erro or validar_campos_produto(ncm_editado, fab_editada, val_editada)
+                if erro:
+                    st.error(erro)
                 else:
-                    editar_produto(produto_id, nome_editado, preco_editado, quantidade_editada)
+                    editar_produto(produto_id, nome_editado, preco_editado, quantidade_editada,
+                                   ncm_editado, lote_editado, fab_editada, val_editada)
                     st.success("Produto atualizado.")
                     st.rerun()
 
@@ -628,10 +839,12 @@ with aba_movimentacoes:
     if produtos.empty:
         st.info("Cadastre um produto antes de registrar movimentações.")
     else:
-        opcoes_mov = {
-            f'{row["nome"]} (estoque: {int(row["quantidade"])})': int(row["id"])
-            for _, row in produtos.iterrows()
-        }
+        opcoes_mov = {}
+        for i, n, q, lt in zip(produtos["id"], produtos["nome"], produtos["quantidade"], produtos["lote"]):
+            rotulo = f"{n}{'' if pd.isna(lt) or not lt else f' · Lote {lt}'} (estoque: {int(q)})"
+            if rotulo in opcoes_mov:  # nomes repetidos não podem se sobrepor
+                rotulo += f" [ID {i}]"
+            opcoes_mov[rotulo] = int(i)
         with st.form("form_movimentacao"):
             escolha = st.selectbox("Produto", list(opcoes_mov.keys()))
             tipo = st.radio("Tipo de movimentação", ["Entrada", "Saída"], horizontal=True)
@@ -647,18 +860,11 @@ with aba_movimentacoes:
 
     st.divider()
     st.subheader("Histórico de movimentações")
-    with conectar() as conn:
-        historico = pd.read_sql_query("""
-            SELECT m.id, p.nome AS produto, m.tipo, m.quantidade, m.data
-            FROM movimentacoes m
-            JOIN produtos p ON p.id = m.produto_id
-            ORDER BY m.id DESC
-            LIMIT 100
-        """, conn)
+    historico = listar_historico()
     if historico.empty:
         st.info("Nenhuma movimentação registrada.")
     else:
-        st.dataframe(historico, use_container_width=True, hide_index=True)
+        st.dataframe(historico.fillna(""), use_container_width=True, hide_index=True)
 
 # --- ABA CONSULTA ---
 with aba_consulta:
@@ -667,15 +873,30 @@ with aba_consulta:
     if produtos.empty:
         st.info("Nenhum produto cadastrado.")
     else:
-        busca = st.text_input("Buscar pelo nome")
+        busca = st.text_input("Buscar por nome, lote ou NCM")
         if busca.strip():
-            produtos = produtos[produtos["nome"].str.contains(busca.strip(), case=False, na=False)]
+            termo = busca.strip()
+            termo_ncm = normalizar_ncm(termo)
+            mascara = (
+                produtos["nome"].str.contains(termo, case=False, na=False, regex=False)
+                | produtos["lote"].fillna("").str.contains(termo, case=False, regex=False)
+            )
+            if termo_ncm:
+                mascara |= produtos["ncm"].fillna("").str.contains(termo_ncm, regex=False)
+            produtos = produtos[mascara]
 
-        produtos_display = produtos.rename(columns={
-            "id": "ID",
-            "nome": "Produto",
-            "preco": "Preço (R$)",
-            "quantidade": "Quantidade"
+        dias = (pd.to_datetime(produtos["validade"], errors="coerce")
+                - pd.Timestamp(date.today())).dt.days
+        produtos_display = pd.DataFrame({
+            "ID": produtos["id"],
+            "Produto": produtos["nome"],
+            "Preço (R$)": produtos["preco"],
+            "Quantidade": produtos["quantidade"],
+            "NCM": produtos["ncm"].map(formatar_ncm),
+            "Lote": produtos["lote"].fillna(""),
+            "Fabricação": _formatar_datas(produtos["fabricacao"]),
+            "Validade": _formatar_datas(produtos["validade"]),
+            "Situação": dias.map(rotulo_validade),
         })
         st.dataframe(
             produtos_display,
@@ -696,6 +917,23 @@ with aba_consulta:
         else:
             st.warning(f"{len(estoque_baixo)} produto(s) com estoque baixo.")
             st.dataframe(estoque_baixo, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("Validade")
+        alerta = st.number_input("Alertar produtos que vencem em até (dias)", min_value=0, value=30, step=1)
+        vencidos = produtos_display[dias < 0]
+        a_vencer = produtos_display[(dias >= 0) & (dias <= alerta)]
+        if dias.notna().sum() == 0:
+            st.info("Nenhum produto com data de validade informada.")
+        elif vencidos.empty and a_vencer.empty:
+            st.success("Nenhum produto vencido ou próximo do vencimento.")
+        else:
+            if not vencidos.empty:
+                st.error(f"{len(vencidos)} produto(s) vencido(s).")
+                st.dataframe(vencidos, use_container_width=True, hide_index=True)
+            if not a_vencer.empty:
+                st.warning(f"{len(a_vencer)} produto(s) vencendo em até {alerta} dia(s).")
+                st.dataframe(a_vencer, use_container_width=True, hide_index=True)
 
 # --- ABA GERENCIAR USUÁRIOS (APENAS ADMIN) ---
 if st.session_state.get("perfil") == "admin" and aba_usuarios:
@@ -756,9 +994,7 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                     st.write(" ") 
                     st.write(" ")
                     if st.button("🗑️ Excluir este Usuário", type="primary"):
-                        usuario_logado_id = conectar().execute(
-                            "SELECT id FROM usuarios WHERE login = ?", (st.session_state.get("usuario"),)
-                        ).fetchone()[0]
+                        usuario_logado_id = obter_id_usuario(st.session_state.get("usuario"))
                         
                         sucesso, msg = excluir_usuario(usuario_id, usuario_logado_id)
                         if sucesso:
