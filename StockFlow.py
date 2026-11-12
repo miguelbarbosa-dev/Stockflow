@@ -1,9 +1,12 @@
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
+import shutil
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -12,7 +15,32 @@ from urllib.parse import quote
 import pandas as pd
 import streamlit as st
 
-DB_NAME = "estoque.db"
+def _caminho_banco():
+    """Banco SEMPRE no mesmo lugar: na pasta do script (ou em STOCKFLOW_DB, se definida).
+    Antes o caminho era relativo à pasta de onde o app era iniciado, então abrir o app
+    de outro lugar criava um banco novo e vazio."""
+    env = os.environ.get("STOCKFLOW_DB")
+    if env:
+        destino = Path(env).expanduser().resolve()
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        return destino
+    destino = Path(__file__).resolve().parent / "estoque.db"
+    legado = Path.cwd() / "estoque.db"
+    if not destino.exists() and legado.exists() and legado.resolve() != destino:
+        # Traz para o lugar fixo os dados de um banco antigo (cópia segura, inclusive com WAL)
+        origem = sqlite3.connect(legado)
+        copia = sqlite3.connect(destino)
+        try:
+            origem.backup(copia)
+        finally:
+            copia.close()
+            origem.close()
+    return destino
+
+
+DB_NAME = str(_caminho_banco())
+PASTA_BACKUP = Path(DB_NAME).parent / "backups"
+BACKUPS_MANTIDOS = 7
 LIMITE_MIN = date(2000, 1, 1)
 LIMITE_MAX = date(2100, 12, 31)
 
@@ -112,10 +140,37 @@ def criar_tabela():
             )
 
 
+def fazer_backup(destino=None):
+    """Cópia consistente do banco (API de backup do SQLite). Retorna o caminho gerado."""
+    if destino is None:
+        PASTA_BACKUP.mkdir(parents=True, exist_ok=True)
+        destino = PASTA_BACKUP / f"estoque_{datetime.now():%Y%m%d}.db"
+    origem = sqlite3.connect(DB_NAME, timeout=10)
+    copia = sqlite3.connect(destino)
+    try:
+        origem.backup(copia)
+    finally:
+        copia.close()
+        origem.close()
+    return destino
+
+
+def backup_diario():
+    """No máximo um backup por dia; mantém só os mais recentes."""
+    try:
+        if not (PASTA_BACKUP / f"estoque_{datetime.now():%Y%m%d}.db").exists():
+            fazer_backup()
+        for antigo in sorted(PASTA_BACKUP.glob("estoque_*.db"))[:-BACKUPS_MANTIDOS]:
+            antigo.unlink()
+    except Exception:
+        pass  # backup nunca deve impedir o sistema de abrir
+
+
 @st.cache_resource(show_spinner=False)
 def inicializar_banco():
     """Prepara o banco uma única vez por processo (e não a cada interação na tela)."""
     criar_tabela()
+    backup_diario()
     return True
 
 
@@ -707,6 +762,18 @@ with st.sidebar:
     
     st.divider()
     seletor_tema()
+    if st.session_state.get("perfil") == "admin":
+        with st.expander("Banco de dados"):
+            st.caption(f"Salvo em: {DB_NAME}")
+            if st.button("Preparar backup", use_container_width=True, key="preparar_backup"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    arq = fazer_backup(Path(tmp) / "backup.db")
+                    st.session_state["backup_bytes"] = arq.read_bytes()
+            if st.session_state.get("backup_bytes"):
+                st.download_button(
+                    "Baixar backup", st.session_state["backup_bytes"],
+                    file_name=f"estoque_{datetime.now():%Y%m%d_%H%M}.db",
+                    mime="application/octet-stream", use_container_width=True)
     st.divider()
     if st.button("Sair", use_container_width=True, type="secondary"):
         st.session_state["autenticado"] = False
