@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import secrets  
 from datetime import datetime
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -237,46 +238,286 @@ def tela_login():
 
 
 # --- Configuração da Página ---
-# 1. Nome alterado para StockFlow e emoji da aba removido (usando "SF")
-st.set_page_config(page_title="StockFlow", page_icon="SF", layout="wide")
+st.set_page_config(
+    page_title="StockFlow",
+    page_icon="SF",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# 2. CSS Personalizado para melhorar o CONTRASTE e a estética
-st.markdown("""
-    <style>
-    /* Título principal com alto contraste e borda inferior */
-    .main-title {
-        font-size: 2.5rem !important;
-        font-weight: 800 !important;
-        color: #0F172A !important; /* Azul muito escuro/quase preto */
-        border-bottom: 3px solid #2563EB; /* Linha azul vibrante */
-        padding-bottom: 0.5rem;
-        margin-bottom: 1rem;
-    }
-    /* Melhora o contraste e destaque dos cards de métrica */
-    [data-testid="stMetric"] {
-        background-color: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 8px;
-        padding: 15px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }
-    /* Garante que o texto geral tenha alto contraste (cinza muito escuro) */
-    .stApp {
-        color: #1E293B;
-    }
-    /* Destaque para subtítulos */
-    .stSubheader {
-        color: #334155;
-        font-weight: 600;
-        margin-top: 1.5rem;
-    }
-    </style>
-""", unsafe_allow_html=True)
+# =====================================================================
+# TEMA (claro / escuro / automático) + estilo do front end
+# =====================================================================
+OPCOES_TEMA = ["Automático (sistema)", "Claro", "Escuro"]
+
+# Paleta de cada tema. Todo o CSS abaixo consome estas variáveis, então
+# trocar de tema é só trocar os valores (nenhuma cor fica "fixa" no CSS).
+PALETA_CLARA = {
+    "color-scheme": "light",
+    "--sf-bg": "#F4F7FB",
+    "--sf-surface": "#FFFFFF",
+    "--sf-surface-2": "#F8FAFC",
+    "--sf-field": "#FFFFFF",
+    "--sf-text": "#1E293B",
+    "--sf-heading": "#0F172A",
+    "--sf-muted": "#64748B",
+    "--sf-border": "#E2E8F0",
+    "--sf-accent": "#2563EB",
+    "--sf-accent-hover": "#1D4ED8",
+    "--sf-on-accent": "#FFFFFF",
+    "--sf-cyan": "#22D3EE",
+    "--sf-shadow": "0 1px 3px rgba(15, 23, 42, 0.08)",
+}
+PALETA_ESCURA = {
+    "color-scheme": "dark",
+    "--sf-bg": "#0B1220",
+    "--sf-surface": "#121A2B",
+    "--sf-surface-2": "#172136",
+    "--sf-field": "#0F1727",
+    "--sf-text": "#E2E8F0",
+    "--sf-heading": "#F8FAFC",
+    "--sf-muted": "#94A3B8",
+    "--sf-border": "#27344D",
+    "--sf-accent": "#3B82F6",
+    "--sf-accent-hover": "#60A5FA",
+    "--sf-on-accent": "#FFFFFF",
+    "--sf-cyan": "#67E8F9",
+    "--sf-shadow": "0 1px 3px rgba(0, 0, 0, 0.5)",
+}
+
+
+def _carrinho_svg(opacidade):
+    """Carrinho de compras só com contorno (azul + ciano claro), fundo transparente."""
+    caminhos = (
+        "<circle cx='8' cy='21' r='1'/>"
+        "<circle cx='19' cy='21' r='1'/>"
+        "<path d='M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12'/>"
+    )
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+        "stroke-linecap='round' stroke-linejoin='round'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#2563EB'/><stop offset='1' stop-color='#67E8F9'/>"
+        "</linearGradient></defs>"
+        f"<g opacity='{opacidade}'>"
+        f"<g stroke='url(#g)' stroke-width='0.55'>{caminhos}</g>"   # contorno azul → ciano
+        f"<g stroke='#A5F3FC' stroke-width='0.12'>{caminhos}</g>"    # fio ciano claro por cima
+        "</g></svg>"
+    )
+    return f'url("data:image/svg+xml,{quote(svg)}")'
+
+
+def _declaracoes(paleta, opacidade_carrinho):
+    itens = dict(paleta)
+    itens["--sf-cart"] = _carrinho_svg(opacidade_carrinho)
+    return ";".join(f"{k}:{v}" for k, v in itens.items())
+
+
+def _tema_nativo_streamlit():
+    """Tema que o próprio Streamlit está usando ('light'/'dark'), se a versão informar."""
+    try:
+        tipo = st.context.theme.type
+        return tipo if tipo in ("light", "dark") else None
+    except Exception:
+        return None
+
+
+CSS_BASE = """
+html, body, .stApp { color-scheme: inherit; }
+
+/* ---------- Fundo e texto geral ---------- */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+    background-color: var(--sf-bg) !important;
+}
+[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stHeader"] * { color: var(--sf-muted) !important; }
+
+.stApp, .stApp p, .stApp li, .stApp label,
+.stApp [data-testid="stWidgetLabel"] *,
+.stApp [data-testid="stMarkdownContainer"] {
+    color: var(--sf-text);
+}
+.stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stCaptionContainer"] * { color: var(--sf-muted) !important; }
+.stApp h1, .stApp h2, .stApp h3, .stApp h4,
+.stApp [data-testid="stHeading"] * { color: var(--sf-heading) !important; }
+.stApp hr { border-color: var(--sf-border) !important; }
+
+/* ---------- Título principal ---------- */
+.main-title {
+    font-size: 2.5rem !important;
+    font-weight: 800 !important;
+    color: var(--sf-heading) !important;
+    border-bottom: 3px solid var(--sf-accent);
+    padding-bottom: 0.5rem;
+    margin-bottom: 1rem;
+}
+[data-testid="stHeading"] h3 { font-weight: 600; margin-top: 1.5rem; }
+
+/* ---------- Cards de métrica ---------- */
+[data-testid="stMetric"] {
+    background-color: var(--sf-surface);
+    border: 1px solid var(--sf-border);
+    border-radius: 10px;
+    padding: 15px;
+    box-shadow: var(--sf-shadow);
+}
+[data-testid="stMetricLabel"] * { color: var(--sf-muted) !important; }
+[data-testid="stMetricValue"] * { color: var(--sf-heading) !important; }
+
+/* ---------- Formulários ---------- */
+[data-testid="stForm"] {
+    background-color: var(--sf-surface);
+    border: 1px solid var(--sf-border) !important;
+    border-radius: 10px;
+}
+
+/* ---------- Campos de entrada ---------- */
+[data-baseweb="input"], [data-baseweb="base-input"],
+[data-baseweb="textarea"], [data-baseweb="select"] > div {
+    background-color: var(--sf-field) !important;
+    border-color: var(--sf-border) !important;
+    color: var(--sf-text) !important;
+}
+[data-baseweb="input"]:focus-within, [data-baseweb="select"] > div:focus-within {
+    border-color: var(--sf-accent) !important;
+    box-shadow: 0 0 0 1px var(--sf-accent) !important;
+}
+.stApp input, .stApp textarea {
+    color: var(--sf-text) !important;
+    -webkit-text-fill-color: var(--sf-text) !important;
+    caret-color: var(--sf-accent);
+}
+.stApp input::placeholder, .stApp textarea::placeholder {
+    color: var(--sf-muted) !important;
+    -webkit-text-fill-color: var(--sf-muted) !important;
+}
+[data-baseweb="select"] * { color: var(--sf-text); }
+[data-testid="stNumberInput"] button {
+    background-color: var(--sf-surface-2) !important;
+    color: var(--sf-text) !important;
+    border-color: var(--sf-border) !important;
+}
+/* Lista suspensa dos selectbox */
+[data-baseweb="popover"], [data-baseweb="popover"] > div,
+[data-baseweb="menu"], [data-baseweb="popover"] ul {
+    background-color: var(--sf-surface) !important;
+    color: var(--sf-text) !important;
+}
+[data-baseweb="popover"] li { color: var(--sf-text) !important; }
+[data-baseweb="popover"] li:hover,
+[data-baseweb="popover"] li[aria-selected="true"] {
+    background-color: var(--sf-surface-2) !important;
+}
+
+/* ---------- Abas ---------- */
+button[data-baseweb="tab"] { color: var(--sf-muted) !important; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--sf-accent) !important; }
+[data-baseweb="tab-highlight"] { background-color: var(--sf-accent) !important; }
+[data-baseweb="tab-border"] { background-color: var(--sf-border) !important; }
+
+/* ---------- Botões ---------- */
+[data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-secondaryFormSubmit"],
+button[kind="secondary"], button[kind="secondaryFormSubmit"] {
+    background-color: var(--sf-surface) !important;
+    color: var(--sf-text) !important;
+    border: 1px solid var(--sf-border) !important;
+}
+[data-testid="stBaseButton-secondary"]:hover, [data-testid="stBaseButton-secondaryFormSubmit"]:hover,
+button[kind="secondary"]:hover, button[kind="secondaryFormSubmit"]:hover {
+    border-color: var(--sf-accent) !important;
+    color: var(--sf-accent) !important;
+}
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"],
+button[kind="primary"], button[kind="primaryFormSubmit"] {
+    background-color: var(--sf-accent) !important;
+    color: var(--sf-on-accent) !important;
+    border: 1px solid var(--sf-accent) !important;
+}
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover,
+button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover {
+    background-color: var(--sf-accent-hover) !important;
+    border-color: var(--sf-accent-hover) !important;
+}
+[data-testid="stBaseButton-primary"] *, [data-testid="stBaseButton-primaryFormSubmit"] *,
+button[kind="primary"] *, button[kind="primaryFormSubmit"] * { color: var(--sf-on-accent) !important; }
+
+/* Foco visível para navegação por teclado */
+.stApp button:focus-visible, .stApp input:focus-visible,
+.stApp [role="radio"]:focus-visible {
+    outline: 2px solid var(--sf-cyan) !important;
+    outline-offset: 2px;
+}
+
+/* ---------- Barra lateral: transparente, com carrinho ao fundo ---------- */
+[data-testid="stSidebar"],
+[data-testid="stSidebar"] > div,
+[data-testid="stSidebarContent"],
+[data-testid="stSidebarUserContent"],
+[data-testid="stSidebarHeader"] {
+    background: transparent !important;
+}
+[data-testid="stSidebar"] {
+    background-image: var(--sf-cart) !important;
+    background-repeat: no-repeat !important;
+    background-position: 50% 58% !important;
+    background-size: min(88%, 340px) auto !important;
+    border-right: 1px solid var(--sf-border);
+}
+[data-testid="stSidebar"] * { color: var(--sf-text); }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 { color: var(--sf-heading) !important; }
+
+/* ---------- Telas pequenas ---------- */
+@media (max-width: 768px) {
+    .main-title { font-size: 1.8rem !important; }
+    [data-testid="stMetric"] { padding: 10px; }
+    [data-testid="stSidebar"] { background-size: 70% auto !important; }
+}
+"""
+
+
+def aplicar_tema():
+    """Injeta o CSS conforme a escolha de tema guardada na sessão."""
+    escolha = st.session_state.get("tema_visual", OPCOES_TEMA[0])
+
+    if escolha == "Claro":
+        raiz = f":root {{ {_declaracoes(PALETA_CLARA, 0.55)} }}"
+        efetivo = "light"
+    elif escolha == "Escuro":
+        raiz = f":root {{ {_declaracoes(PALETA_ESCURA, 0.45)} }}"
+        efetivo = "dark"
+    else:  # Automático: segue o tema do navegador / sistema operacional
+        raiz = (
+            f":root {{ {_declaracoes(PALETA_CLARA, 0.55)} }}\n"
+            f"@media (prefers-color-scheme: dark) {{ :root {{ {_declaracoes(PALETA_ESCURA, 0.45)} }} }}"
+        )
+        efetivo = None
+
+    # Tabelas (st.dataframe) são desenhadas em canvas e não obedecem ao CSS.
+    # Se o tema escolhido for o oposto do tema nativo do Streamlit, inverte as cores delas.
+    extra = ""
+    nativo = _tema_nativo_streamlit()
+    if efetivo and nativo and efetivo != nativo:
+        extra = '[data-testid="stDataFrame"] { filter: invert(1) hue-rotate(180deg); }'
+
+    st.markdown(f"<style>{raiz}\n{CSS_BASE}\n{extra}</style>", unsafe_allow_html=True)
+
+
+def seletor_tema():
+    """Controle para o usuário alternar entre automático, claro e escuro."""
+    st.radio("Tema", OPCOES_TEMA, key="tema_visual")
+
+
+aplicar_tema()
 
 criar_tabela()
 
 # Bloqueia todas as funcionalidades até o usuário autenticar.
 if not st.session_state.get("autenticado", False):
+    with st.sidebar:
+        st.markdown("### StockFlow")
+        seletor_tema()
     tela_login()
     st.stop()
 
@@ -286,6 +527,8 @@ with st.sidebar:
     perfil_display = "Administrador" if st.session_state.get("perfil") == "admin" else "Funcionário"
     st.write(f"👤 Perfil: **{perfil_display}**")
     
+    st.divider()
+    seletor_tema()
     st.divider()
     if st.button("Sair", use_container_width=True, type="secondary"):
         st.session_state["autenticado"] = False
