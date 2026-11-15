@@ -90,7 +90,8 @@ def criar_tabela():
                 ncm TEXT,
                 lote TEXT,
                 fabricacao TEXT,
-                validade TEXT
+                validade TEXT,
+                preco_venda REAL
             )
         """)
         conn.execute("""
@@ -124,6 +125,17 @@ def criar_tabela():
         for coluna in ("ncm", "lote", "fabricacao", "validade"):
             if coluna not in existentes:
                 conn.execute(f"ALTER TABLE produtos ADD COLUMN {coluna} TEXT")
+
+        if "preco_venda" not in existentes:
+            conn.execute("ALTER TABLE produtos ADD COLUMN preco_venda REAL")
+
+        # Garantia no próprio banco: nome único (sem diferenciar maiúsculas/minúsculas).
+        # Se já houver nomes repetidos de antes, o índice não é criado; o app continua
+        # impedindo novos duplicados.
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_produtos_nome ON produtos(nome COLLATE NOCASE)")
+        except sqlite3.IntegrityError:
+            pass
 
         # Índice que acelera a verificação de exclusão e o histórico
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mov_produto ON movimentacoes(produto_id)")
@@ -242,6 +254,8 @@ def carregar_tabela_ncm():
 
 def validar_ncm(valor):
     """Retorna (ok, mensagem, descricao). Valida formato e, se houver tabela, a existência."""
+    if not re.fullmatch(r"[0-9.]*", str(valor or "").strip()):
+        return False, "O NCM deve conter apenas números (ex.: 2106.90.90).", None
     n = normalizar_ncm(valor)
     if len(n) != 8:
         return False, "O NCM deve ter 8 dígitos (ex.: 2106.90.90).", None
@@ -268,12 +282,15 @@ def para_data(valor):
         return None
 
 
-def validar_campos_produto(ncm, fabricacao, validade):
+def validar_campos_produto(ncm, fabricacao, validade, lote=""):
     """Retorna a mensagem de erro ou None se estiver tudo certo."""
-    if normalizar_ncm(ncm) or str(ncm or "").strip():
-        ok, msg, _ = validar_ncm(ncm)
-        if not ok:
-            return msg
+    if not normalizar_ncm(ncm):
+        return "Informe o NCM do produto."
+    ok, msg, _ = validar_ncm(ncm)
+    if not ok:
+        return msg
+    if str(lote or "").strip() and not re.fullmatch(r"[0-9]+", str(lote).strip()):
+        return "O lote deve conter apenas números."
     if fabricacao and fabricacao > date.today():
         return "A data de fabricação não pode ser futura."
     if fabricacao and validade and validade < fabricacao:
@@ -307,7 +324,7 @@ def _limpar_cache_estoque():
 def listar_produtos():
     with conectar() as conn:
         return pd.read_sql_query(
-            "SELECT id, nome, preco, quantidade, ncm, lote, fabricacao, validade "
+            "SELECT id, nome, preco, preco_venda, quantidade, ncm, lote, fabricacao, validade "
             "FROM produtos ORDER BY nome",
             conn
         )
@@ -334,26 +351,67 @@ def _campos_extras(ncm, lote, fabricacao, validade):
     )
 
 
-def adicionar_produto(nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None):
-    with conectar() as conn:
-        conn.execute(
-            "INSERT INTO produtos (nome, preco, quantidade, criado_em, ncm, lote, fabricacao, validade) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (nome.strip(), float(preco), int(quantidade), agora(),
-             *_campos_extras(ncm, lote, fabricacao, validade))
-        )
-    _limpar_cache_estoque()
+MSG_NOME_DUPLICADO = "Já existe um produto com este nome."
 
 
-def editar_produto(produto_id, nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None):
-    with conectar() as conn:
-        conn.execute(
-            "UPDATE produtos SET nome = ?, preco = ?, quantidade = ?, "
-            "ncm = ?, lote = ?, fabricacao = ?, validade = ? WHERE id = ?",
-            (nome.strip(), float(preco), int(quantidade),
-             *_campos_extras(ncm, lote, fabricacao, validade), int(produto_id))
-        )
+def _nome_duplicado(conn, nome, ignorar_id=None):
+    """Compara sem diferenciar maiúsculas/minúsculas nem espaços nas pontas."""
+    alvo = nome.strip().casefold()
+    return any(
+        n.strip().casefold() == alvo
+        for i, n in conn.execute("SELECT id, nome FROM produtos")
+        if i != ignorar_id
+    )
+
+
+def adicionar_produto(nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None, preco_venda=None):
+    """Retorna (ok, mensagem). Regras: nome único, quantidade >= 1 e NCM obrigatório."""
+    if not nome.strip():
+        return False, "Informe o nome do produto."
+    if int(quantidade) < 1:
+        return False, "A quantidade deve ser de pelo menos 1."
+    erro = validar_campos_produto(ncm, None, None, lote)
+    if erro:
+        return False, erro
+    try:
+        with conectar() as conn:
+            if _nome_duplicado(conn, nome):
+                return False, MSG_NOME_DUPLICADO
+            conn.execute(
+                "INSERT INTO produtos (nome, preco, quantidade, criado_em, ncm, lote, fabricacao, validade, preco_venda) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (nome.strip(), float(preco), int(quantidade), agora(),
+                 *_campos_extras(ncm, lote, fabricacao, validade),
+                 None if preco_venda is None else float(preco_venda))
+            )
+    except sqlite3.IntegrityError:
+        return False, MSG_NOME_DUPLICADO
     _limpar_cache_estoque()
+    return True, "Produto cadastrado com sucesso."
+
+
+def editar_produto(produto_id, nome, preco, quantidade, ncm="", lote="", fabricacao=None, validade=None, preco_venda=None):
+    """Retorna (ok, mensagem). O nome não pode coincidir com o de outro produto."""
+    if not nome.strip():
+        return False, "O nome do produto é obrigatório."
+    erro = validar_campos_produto(ncm, None, None, lote)
+    if erro:
+        return False, erro
+    try:
+        with conectar() as conn:
+            if _nome_duplicado(conn, nome, ignorar_id=int(produto_id)):
+                return False, MSG_NOME_DUPLICADO
+            conn.execute(
+                "UPDATE produtos SET nome = ?, preco = ?, quantidade = ?, "
+                "ncm = ?, lote = ?, fabricacao = ?, validade = ?, preco_venda = ? WHERE id = ?",
+                (nome.strip(), float(preco), int(quantidade),
+                 *_campos_extras(ncm, lote, fabricacao, validade),
+                 None if preco_venda is None else float(preco_venda), int(produto_id))
+            )
+    except sqlite3.IntegrityError:
+        return False, MSG_NOME_DUPLICADO
+    _limpar_cache_estoque()
+    return True, "Produto atualizado."
 
 
 def excluir_produto(produto_id):
@@ -793,7 +851,7 @@ valor_estoque = float((produtos["preco"] * produtos["quantidade"]).sum()) if not
 c1, c2, c3 = st.columns(3)
 c1.metric("Produtos cadastrados", total_produtos)
 c2.metric("Unidades em estoque", unidades_estoque)
-c3.metric("Valor estimado do estoque", f"R$ {valor_estoque:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+c3.metric("Valor do estoque (custo)", f"R$ {valor_estoque:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
 # Definição das abas
 abas = ["Cadastrar / Editar Produtos", "Entrada e Saída", "Consultar Estoque"]
@@ -802,9 +860,69 @@ if st.session_state.get("perfil") == "admin":
 
 aba_produtos, aba_movimentacoes, aba_consulta, *aba_usuarios = st.tabs(abas)
 
+# ---------------------------------------------------------------------
+# Campos de preço ligados: compra + margem (%) <-> venda
+# ---------------------------------------------------------------------
+MARGEM_PADRAO = 30.0  # % sobre o preço de compra, usada em produtos novos
+
+
+def _recalcular_venda(k):
+    compra = st.session_state.get(f"compra_{k}") or 0.0
+    margem = st.session_state.get(f"margem_{k}") or 0.0
+    st.session_state[f"venda_{k}"] = round(compra * (1 + margem / 100), 2)
+
+
+def _recalcular_margem(k):
+    compra = st.session_state.get(f"compra_{k}") or 0.0
+    venda = st.session_state.get(f"venda_{k}") or 0.0
+    margem = (venda / compra - 1) * 100 if compra > 0 else 0.0
+    st.session_state[f"margem_{k}"] = round(min(max(margem, 0.0), 1000.0), 2)
+
+
+def aviso_numerico(valor, rotulo, permitir_ponto=False):
+    """Aviso na hora (ao sair do campo) quando há letras ou símbolos num campo só numérico."""
+    padrao = r"[0-9.]*" if permitir_ponto else r"[0-9]*"
+    if valor and not re.fullmatch(padrao, valor.strip()):
+        st.markdown(f":red[⚠ O {rotulo} aceita apenas números.]")
+
+
+def campos_preco(k, compra_ini, venda_ini):
+    """Mostra Preço de compra, Margem (%) e Preço de venda.
+    Mudou a compra ou a margem -> a venda é recalculada automaticamente.
+    Mudou a venda -> a margem se ajusta. Retorna (compra, margem, venda)."""
+    if f"compra_{k}" not in st.session_state:
+        compra_ini = float(compra_ini or 0.0)
+        if venda_ini is None or pd.isna(venda_ini):
+            margem_ini, venda_ini = MARGEM_PADRAO, round(compra_ini * (1 + MARGEM_PADRAO / 100), 2)
+        else:
+            venda_ini = float(venda_ini)
+            margem_ini = round(min(max((venda_ini / compra_ini - 1) * 100, 0.0), 1000.0), 2) if compra_ini > 0 else 0.0
+        st.session_state[f"compra_{k}"] = compra_ini
+        st.session_state[f"margem_{k}"] = margem_ini
+        st.session_state[f"venda_{k}"] = venda_ini
+
+    c1, c2, c3 = st.columns(3)
+    compra = c1.number_input("Preço de compra (R$)", min_value=0.0, step=0.5, format="%.2f",
+                             key=f"compra_{k}", on_change=_recalcular_venda, args=(k,))
+    margem = c2.number_input("Margem de lucro (%)", min_value=0.0, max_value=1000.0, step=1.0,
+                             format="%.2f", key=f"margem_{k}", on_change=_recalcular_venda, args=(k,),
+                             help="Percentual somado ao preço de compra para calcular o preço de venda.")
+    venda = c3.number_input("Preço de venda (R$)", min_value=0.0, step=0.5, format="%.2f",
+                            key=f"venda_{k}", on_change=_recalcular_margem, args=(k,),
+                            help="Calculado automaticamente (compra + margem). Se você digitar um valor, a margem se ajusta.")
+    if venda < compra:
+        st.warning("O preço de venda está abaixo do preço de compra.")
+    return compra, margem, venda
+
+
 # --- ABA PRODUTOS ---
 with aba_produtos:
+    aviso = st.session_state.pop("aviso_produto", None)
+    if aviso:
+        st.success(aviso)
+
     st.subheader("Cadastrar produto")
+    st.caption("Campos com * são obrigatórios. Não são aceitos nomes repetidos.")
 
     with st.expander("Validador de NCM"):
         ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste", placeholder="Ex.: 2106.90.90")
@@ -817,30 +935,35 @@ with aba_produtos:
             else:
                 st.error(msg_ncm)
 
-    with st.form("form_cadastro", clear_on_submit=True):
-        nome = st.text_input("Nome do produto")
-        col1, col2 = st.columns(2)
-        preco = col1.number_input("Preço (R$)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-        quantidade = col2.number_input("Quantidade inicial", min_value=0, value=0, step=1)
-        ncm = st.text_input("NCM", placeholder="0000.00.00", max_chars=10,
-                            help="8 dígitos, com ou sem pontos. Opcional, mas validado se preenchido.")
-        cl, cf, cv = st.columns(3)
-        lote = cl.text_input("Lote")
-        fabricacao = cf.date_input("Fabricação", value=None, min_value=LIMITE_MIN,
-                                   max_value=date.today(), format="DD/MM/YYYY")
-        validade = cv.date_input("Validade", value=None, min_value=LIMITE_MIN,
-                                 max_value=LIMITE_MAX, format="DD/MM/YYYY")
-        enviado = st.form_submit_button("Cadastrar produto", type="primary")
+    # O número muda após cada cadastro, o que recria os campos limpos
+    kc = f"cad{st.session_state.get('cad_n', 0)}"
+    nome = st.text_input("Nome do produto *", key=f"nome_{kc}")
+    compra, margem, venda = campos_preco(kc, 0.0, None)
+    quantidade = st.number_input("Quantidade inicial *", min_value=1, value=1, step=1, key=f"qtd_{kc}")
+    ncm = st.text_input("NCM *", placeholder="0000.00.00", max_chars=10, key=f"ncm_{kc}",
+                        help="Obrigatório. Somente números: 8 dígitos, com ou sem pontos.")
+    cl, cf, cv = st.columns(3)
+    lote = cl.text_input("Lote (somente números)", key=f"lote_{kc}")
+    fabricacao = cf.date_input("Fabricação", value=None, min_value=LIMITE_MIN, max_value=date.today(),
+                               format="DD/MM/YYYY", key=f"fab_{kc}")
+    validade = cv.date_input("Validade", value=None, min_value=LIMITE_MIN, max_value=LIMITE_MAX,
+                             format="DD/MM/YYYY", key=f"val_{kc}")
 
-        if enviado:
-            erro = None if nome.strip() else "Informe o nome do produto."
-            erro = erro or validar_campos_produto(ncm, fabricacao, validade)
-            if erro:
-                st.error(erro)
-            else:
-                adicionar_produto(nome, preco, quantidade, ncm, lote, fabricacao, validade)
-                st.success("Produto cadastrado com sucesso.")
-                st.rerun()
+    aviso_numerico(ncm, "NCM", True)
+    aviso_numerico(lote, "lote")
+    if st.button("Cadastrar produto", type="primary", key=f"cadastrar_{kc}"):
+        erro = None if nome.strip() else "Informe o nome do produto."
+        erro = erro or (None if quantidade >= 1 else "A quantidade deve ser de pelo menos 1.")
+        erro = erro or validar_campos_produto(ncm, fabricacao, validade, lote)
+        if not erro:
+            ok, erro = adicionar_produto(nome, compra, quantidade, ncm, lote, fabricacao, validade, venda)
+            erro = None if ok else erro
+        if erro:
+            st.error(erro)
+        else:
+            st.session_state["aviso_produto"] = "Produto cadastrado com sucesso."
+            st.session_state["cad_n"] = st.session_state.get("cad_n", 0) + 1
+            st.rerun()
 
     st.divider()
     st.subheader("Editar ou excluir produto")
@@ -852,40 +975,41 @@ with aba_produtos:
         selecionado = st.selectbox("Selecione um produto", list(opcoes.keys()), key="produto_editar")
         produto_id = opcoes[selecionado]
         linha = produtos[produtos["id"] == produto_id].iloc[0]
+        qtd_atual = int(linha["quantidade"])
+        # A chave inclui o estoque atual: se ele mudar em Movimentações, o campo é recarregado
+        # e uma tela desatualizada nunca sobrescreve o estoque.
+        ke = f"ed{produto_id}_{qtd_atual}"
 
-        with st.form("form_edicao"):
-            nome_editado = st.text_input("Nome", value=str(linha["nome"]), key=f"nome_{produto_id}")
-            col1, col2 = st.columns(2)
-            preco_editado = col1.number_input(
-                "Preço (R$)", min_value=0.0, value=float(linha["preco"]), step=0.5,
-                format="%.2f", key=f"preco_{produto_id}"
-            )
-            quantidade_editada = col2.number_input(
-                "Quantidade", min_value=0, value=int(linha["quantidade"]), step=1,
-                key=f"quantidade_{produto_id}"
-            )
-            ncm_editado = st.text_input(
-                "NCM", value=formatar_ncm(linha["ncm"]), max_chars=10, key=f"ncm_{produto_id}")
-            cl, cf, cv = st.columns(3)
-            lote_editado = cl.text_input(
-                "Lote", value="" if pd.isna(linha["lote"]) else str(linha["lote"]), key=f"lote_{produto_id}")
-            fab_editada = cf.date_input(
-                "Fabricação", value=para_data(linha["fabricacao"]), min_value=LIMITE_MIN,
-                max_value=date.today(), format="DD/MM/YYYY", key=f"fab_{produto_id}")
-            val_editada = cv.date_input(
-                "Validade", value=para_data(linha["validade"]), min_value=LIMITE_MIN,
-                max_value=LIMITE_MAX, format="DD/MM/YYYY", key=f"val_{produto_id}")
-            salvar = st.form_submit_button("Salvar alterações")
-            if salvar:
-                erro = None if nome_editado.strip() else "O nome do produto é obrigatório."
-                erro = erro or validar_campos_produto(ncm_editado, fab_editada, val_editada)
-                if erro:
-                    st.error(erro)
-                else:
-                    editar_produto(produto_id, nome_editado, preco_editado, quantidade_editada,
-                                   ncm_editado, lote_editado, fab_editada, val_editada)
-                    st.success("Produto atualizado.")
-                    st.rerun()
+        nome_editado = st.text_input("Nome *", value=str(linha["nome"]), key=f"nome_{ke}")
+        preco_editado, _, venda_editada = campos_preco(ke, linha["preco"], linha["preco_venda"])
+        quantidade_editada = st.number_input("Quantidade *", min_value=0, value=qtd_atual, step=1, key=f"qtd_{ke}")
+        ncm_editado = st.text_input("NCM *", value=formatar_ncm(linha["ncm"]), max_chars=10, key=f"ncm_{ke}")
+        cl, cf, cv = st.columns(3)
+        lote_editado = cl.text_input(
+            "Lote (somente números)", value="" if pd.isna(linha["lote"]) else str(linha["lote"]), key=f"lote_{ke}")
+        fab_editada = cf.date_input(
+            "Fabricação", value=para_data(linha["fabricacao"]), min_value=LIMITE_MIN,
+            max_value=date.today(), format="DD/MM/YYYY", key=f"fab_{ke}")
+        val_editada = cv.date_input(
+            "Validade", value=para_data(linha["validade"]), min_value=LIMITE_MIN,
+            max_value=LIMITE_MAX, format="DD/MM/YYYY", key=f"val_{ke}")
+
+        aviso_numerico(ncm_editado, "NCM", True)
+        aviso_numerico(lote_editado, "lote")
+        if st.button("Salvar alterações", key=f"salvar_{ke}"):
+            erro = None if nome_editado.strip() else "O nome do produto é obrigatório."
+            if not erro and quantidade_editada < 1 and quantidade_editada != qtd_atual:
+                erro = "A quantidade não pode ficar zerada. Para baixar o estoque, use a aba Movimentações."
+            erro = erro or validar_campos_produto(ncm_editado, fab_editada, val_editada, lote_editado)
+            if not erro:
+                ok, erro = editar_produto(produto_id, nome_editado, preco_editado, quantidade_editada,
+                                          ncm_editado, lote_editado, fab_editada, val_editada, venda_editada)
+                erro = None if ok else erro
+            if erro:
+                st.error(erro)
+            else:
+                st.session_state["aviso_produto"] = "Produto atualizado."
+                st.rerun()
 
         # RESTRIÇÃO DE EXCLUSÃO: Apenas Admin
         if st.session_state.get("perfil") == "admin":
@@ -940,6 +1064,9 @@ with aba_consulta:
     if produtos.empty:
         st.info("Nenhum produto cadastrado.")
     else:
+        sem_ncm = int((produtos["ncm"].fillna("") == "").sum())
+        if sem_ncm:
+            st.warning(f"{sem_ncm} produto(s) antigo(s) sem NCM. Edite-os na aba Produtos para completar o cadastro.")
         busca = st.text_input("Buscar por nome, lote ou NCM")
         if busca.strip():
             termo = busca.strip()
@@ -957,7 +1084,9 @@ with aba_consulta:
         produtos_display = pd.DataFrame({
             "ID": produtos["id"],
             "Produto": produtos["nome"],
-            "Preço (R$)": produtos["preco"],
+            "Preço de compra": produtos["preco"],
+            "Margem (%)": ((produtos["preco_venda"] / produtos["preco"] - 1) * 100).where(produtos["preco"] > 0).round(2),
+            "Preço de venda": produtos["preco_venda"],
             "Quantidade": produtos["quantidade"],
             "NCM": produtos["ncm"].map(formatar_ncm),
             "Lote": produtos["lote"].fillna(""),
@@ -970,7 +1099,9 @@ with aba_consulta:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Preço (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Preço de compra": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Preço de venda": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Margem (%)": st.column_config.NumberColumn(format="%.2f"),
                 "Quantidade": st.column_config.NumberColumn(format="%d")
             }
         )
