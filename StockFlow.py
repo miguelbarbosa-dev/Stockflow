@@ -528,10 +528,41 @@ def tela_login():
             st.error("Login ou senha incorretos.")
 
 
+@st.cache_resource(show_spinner=False)
+def _icone_pagina():
+    """Ícone da aba do navegador: caixa só com contorno (azul → ciano claro), fundo transparente."""
+    try:
+        from PIL import Image, ImageDraw
+        S, N = 128, 512
+        k = N / 24
+        P = lambda x, y: (x * k, y * k)
+        hexa = [P(12, 2), P(21, 7.5), P(21, 16.5), P(12, 22), P(3, 16.5), P(3, 7.5), P(12, 2)]
+        linhas = [[P(3.3, 7), P(12, 12), P(20.7, 7)], [P(12, 12), P(12, 22)], [P(7.5, 4.3), P(16.5, 9.4)]]
+
+        def mascara(largura):
+            m = Image.new("L", (N, N), 0)
+            d = ImageDraw.Draw(m)
+            r = largura * k / 2
+            for pts in [hexa, *linhas]:
+                d.line(pts, fill=255, width=int(largura * k))
+                for x, y in pts:  # pontas arredondadas
+                    d.ellipse((x - r, y - r, x + r, y + r), fill=255)
+            return m
+
+        gradiente = Image.linear_gradient("L").resize((N, N))
+        cor = Image.composite(Image.new("RGBA", (N, N), "#67E8F9"), Image.new("RGBA", (N, N), "#2563EB"), gradiente)
+        img = Image.new("RGBA", (N, N), (0, 0, 0, 0))  # fundo 100% transparente
+        img.paste(cor, (0, 0), mascara(1.6))
+        img.paste(Image.new("RGBA", (N, N), "#CFFAFE"), (0, 0), mascara(0.4))  # fio ciano claro
+        return img.resize((S, S), Image.LANCZOS)
+    except Exception:
+        return "📦"
+
+
 # --- Configuração da Página ---
 st.set_page_config(
     page_title="StockFlow",
-    page_icon="SF",
+    page_icon=_icone_pagina(),
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -598,9 +629,31 @@ def _carrinho_svg(opacidade):
     return f'url("data:image/svg+xml,{quote(svg)}")'
 
 
+def _caixa_svg(opacidade):
+    """Caixa (pacote) só com contorno, azul + ciano claro, fundo transparente."""
+    caminhos = (
+        "<path d='m7.5 4.27 9 5.15'/>"
+        "<path d='M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z'/>"
+        "<path d='m3.3 7 8.7 5 8.7-5'/><path d='M12 22V12'/>"
+    )
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' "
+        "stroke-linecap='round' stroke-linejoin='round'>"
+        "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#2563EB'/><stop offset='1' stop-color='#67E8F9'/>"
+        "</linearGradient></defs>"
+        f"<g opacity='{opacidade}'>"
+        f"<g stroke='url(#g)' stroke-width='0.4'>{caminhos}</g>"
+        f"<g stroke='#A5F3FC' stroke-width='0.1'>{caminhos}</g>"
+        "</g></svg>"
+    )
+    return f'url("data:image/svg+xml,{quote(svg)}")'
+
+
 def _declaracoes(paleta, opacidade_carrinho):
     itens = dict(paleta)
     itens["--sf-cart"] = _carrinho_svg(opacidade_carrinho)
+    itens["--sf-box"] = _caixa_svg(round(opacidade_carrinho * 0.45, 2))  # mais discreta, fica atrás do conteúdo
     return ";".join(f"{k}:{v}" for k, v in itens.items())
 
 
@@ -619,6 +672,13 @@ html, body, .stApp { color-scheme: inherit; }
 /* ---------- Fundo e texto geral ---------- */
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
     background-color: var(--sf-bg) !important;
+}
+/* Caixa transparente no meio do site, atrás do conteúdo */
+[data-testid="stMain"] {
+    background-image: var(--sf-box) !important;
+    background-repeat: no-repeat !important;
+    background-position: 50% 50% !important;
+    background-size: min(46%, 460px) auto !important;
 }
 [data-testid="stHeader"] { background: transparent !important; }
 [data-testid="stHeader"] * { color: var(--sf-muted) !important; }
@@ -867,15 +927,19 @@ MARGEM_PADRAO = 30.0  # % sobre o preço de compra, usada em produtos novos
 
 
 def _recalcular_venda(k):
-    compra = st.session_state.get(f"compra_{k}") or 0.0
+    compra = st.session_state.get(f"compra_{k}")
     margem = st.session_state.get(f"margem_{k}") or 0.0
+    if compra is None:  # campo ainda vazio
+        return
     st.session_state[f"venda_{k}"] = round(compra * (1 + margem / 100), 2)
 
 
 def _recalcular_margem(k):
     compra = st.session_state.get(f"compra_{k}") or 0.0
-    venda = st.session_state.get(f"venda_{k}") or 0.0
-    margem = (venda / compra - 1) * 100 if compra > 0 else 0.0
+    venda = st.session_state.get(f"venda_{k}")
+    if venda is None or compra <= 0:
+        return
+    margem = (venda / compra - 1) * 100
     st.session_state[f"margem_{k}"] = round(min(max(margem, 0.0), 1000.0), 2)
 
 
@@ -890,7 +954,10 @@ def campos_preco(k, compra_ini, venda_ini):
     """Mostra Preço de compra, Margem (%) e Preço de venda.
     Mudou a compra ou a margem -> a venda é recalculada automaticamente.
     Mudou a venda -> a margem se ajusta. Retorna (compra, margem, venda)."""
-    if f"compra_{k}" not in st.session_state:
+    novo = compra_ini is None  # produto novo: preço de compra e de venda começam VAZIOS
+    if novo:
+        st.session_state.setdefault(f"margem_{k}", MARGEM_PADRAO)
+    elif f"compra_{k}" not in st.session_state:
         compra_ini = float(compra_ini or 0.0)
         if venda_ini is None or pd.isna(venda_ini):
             margem_ini, venda_ini = MARGEM_PADRAO, round(compra_ini * (1 + MARGEM_PADRAO / 100), 2)
@@ -901,17 +968,22 @@ def campos_preco(k, compra_ini, venda_ini):
         st.session_state[f"margem_{k}"] = margem_ini
         st.session_state[f"venda_{k}"] = venda_ini
 
+    vazio = {"value": None} if novo else {}  # sem "0.00" para apagar: é só digitar
     c1, c2, c3 = st.columns(3)
     compra = c1.number_input("Preço de compra (R$)", min_value=0.0, step=0.5, format="%.2f",
-                             key=f"compra_{k}", on_change=_recalcular_venda, args=(k,))
+                             key=f"compra_{k}", on_change=_recalcular_venda, args=(k,), **vazio)
     margem = c2.number_input("Margem de lucro (%)", min_value=0.0, max_value=1000.0, step=1.0,
                              format="%.2f", key=f"margem_{k}", on_change=_recalcular_venda, args=(k,),
                              help="Percentual somado ao preço de compra para calcular o preço de venda.")
     venda = c3.number_input("Preço de venda (R$)", min_value=0.0, step=0.5, format="%.2f",
                             key=f"venda_{k}", on_change=_recalcular_margem, args=(k,),
-                            help="Calculado automaticamente (compra + margem). Se você digitar um valor, a margem se ajusta.")
-    if venda < compra:
+                            help="Calculado automaticamente (compra + margem). Se você digitar um valor, a margem se ajusta.",
+                            **vazio)
+    if compra is not None and venda is not None and venda < compra:
         st.warning("O preço de venda está abaixo do preço de compra.")
+    compra, margem = compra or 0.0, margem or 0.0
+    if venda is None:
+        venda = round(compra * (1 + margem / 100), 2)
     return compra, margem, venda
 
 
@@ -925,7 +997,7 @@ with aba_produtos:
     st.caption("Campos com * são obrigatórios. Não são aceitos nomes repetidos.")
 
     with st.expander("Validador de NCM"):
-        ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste", placeholder="Ex.: 2106.90.90")
+        ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste")
         if ncm_teste.strip():
             ok_ncm, msg_ncm, desc_ncm = validar_ncm(ncm_teste)
             if ok_ncm:
@@ -938,9 +1010,9 @@ with aba_produtos:
     # O número muda após cada cadastro, o que recria os campos limpos
     kc = f"cad{st.session_state.get('cad_n', 0)}"
     nome = st.text_input("Nome do produto *", key=f"nome_{kc}")
-    compra, margem, venda = campos_preco(kc, 0.0, None)
-    quantidade = st.number_input("Quantidade inicial *", min_value=1, value=1, step=1, key=f"qtd_{kc}")
-    ncm = st.text_input("NCM *", placeholder="0000.00.00", max_chars=10, key=f"ncm_{kc}",
+    compra, margem, venda = campos_preco(kc, None, None)
+    quantidade = st.number_input("Quantidade inicial *", min_value=1, value=None, step=1, key=f"qtd_{kc}")
+    ncm = st.text_input("NCM *", max_chars=10, key=f"ncm_{kc}",
                         help="Obrigatório. Somente números: 8 dígitos, com ou sem pontos.")
     cl, cf, cv = st.columns(3)
     lote = cl.text_input("Lote (somente números)", key=f"lote_{kc}")
@@ -953,7 +1025,7 @@ with aba_produtos:
     aviso_numerico(lote, "lote")
     if st.button("Cadastrar produto", type="primary", key=f"cadastrar_{kc}"):
         erro = None if nome.strip() else "Informe o nome do produto."
-        erro = erro or (None if quantidade >= 1 else "A quantidade deve ser de pelo menos 1.")
+        erro = erro or (None if quantidade and quantidade >= 1 else "Informe a quantidade inicial (mínimo 1).")
         erro = erro or validar_campos_produto(ncm, fabricacao, validade, lote)
         if not erro:
             ok, erro = adicionar_produto(nome, compra, quantidade, ncm, lote, fabricacao, validade, venda)
@@ -1039,15 +1111,18 @@ with aba_movimentacoes:
         with st.form("form_movimentacao"):
             escolha = st.selectbox("Produto", list(opcoes_mov.keys()))
             tipo = st.radio("Tipo de movimentação", ["Entrada", "Saída"], horizontal=True)
-            qtd_mov = st.number_input("Quantidade", min_value=1, value=1, step=1)
+            qtd_mov = st.number_input("Quantidade", min_value=1, value=None, step=1)
             registrar = st.form_submit_button("Registrar movimentação", type="primary")
             if registrar:
-                sucesso, mensagem = movimentar_estoque(opcoes_mov[escolha], tipo, qtd_mov)
-                if sucesso:
-                    st.success(mensagem)
-                    st.rerun()
+                if not qtd_mov:
+                    st.error("Informe a quantidade.")
                 else:
-                    st.error(mensagem)
+                    sucesso, mensagem = movimentar_estoque(opcoes_mov[escolha], tipo, qtd_mov)
+                    if sucesso:
+                        st.success(mensagem)
+                        st.rerun()
+                    else:
+                        st.error(mensagem)
 
     st.divider()
     st.subheader("Histórico de movimentações")
@@ -1200,3 +1275,20 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                             st.rerun()
                         else:
                             st.error(msg)
+
+try:
+    import streamlit.components.v1 as components
+    components.html("""<script>
+    const doc = window.parent.document;
+    if (!doc.__sfSelecionar) {
+      doc.__sfSelecionar = true;
+      doc.addEventListener('focusin', (e) => {
+        const el = e.target;
+        if (el && el.tagName === 'INPUT' && el.closest('[data-testid="stNumberInput"]')) {
+          setTimeout(() => el.select(), 0);
+        }
+      });
+    }
+    </script>""", height=0)
+except Exception:
+    pass
