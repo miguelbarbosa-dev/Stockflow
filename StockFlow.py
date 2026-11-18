@@ -623,8 +623,8 @@ def tela_login():
     st.write("Entre com seu usuário e senha para acessar o sistema.")
 
     with st.form("form_login"):
-        login = st.text_input("Login")
-        senha = st.text_input("Senha", type="password")
+        login = st.text_input("Login", autocomplete="username")
+        senha = st.text_input("Senha", type="password", autocomplete="current-password")
         entrar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
 
     if entrar:
@@ -1046,11 +1046,35 @@ MARGEM_PADRAO = 30.0  # % sobre o preço de compra, usada em produtos novos
 
 
 def _recalcular_venda(k):
+    """Compra ou margem mudou. Se a pessoa digitou o preço de venda à mão, ele é respeitado
+    (só a margem se ajusta); do contrário, a venda é recalculada a partir da margem."""
     compra = st.session_state.get(f"compra_{k}")
     margem = st.session_state.get(f"margem_{k}") or 0.0
-    if compra is None:  # campo ainda vazio
+    manual = st.session_state.get(f"venda_manual_{k}", False)
+    if compra is None:  # campo apagado: não deixa uma venda "velha" sobrando
+        if not manual and st.session_state.get(f"novo_{k}"):
+            st.session_state[f"venda_{k}"] = None
+        return
+    if manual and st.session_state.get(f"venda_{k}") is not None and compra > 0:
+        _recalcular_margem(k)
         return
     st.session_state[f"venda_{k}"] = round(compra * (1 + margem / 100), 2)
+
+
+def _ao_mudar_margem(k):
+    """Mexer na margem é pedir um preço calculado: a venda deixa de ser manual."""
+    st.session_state[f"venda_manual_{k}"] = False
+    _recalcular_venda(k)
+
+
+def _ao_mudar_venda(k):
+    """Venda digitada fica como está e a margem se ajusta. Campo apagado volta ao cálculo."""
+    venda = st.session_state.get(f"venda_{k}")
+    st.session_state[f"venda_manual_{k}"] = venda is not None
+    if venda is None:
+        _recalcular_venda(k)
+    else:
+        _recalcular_margem(k)
 
 
 def _recalcular_margem(k):
@@ -1074,6 +1098,7 @@ def campos_preco(k, compra_ini, venda_ini):
     Mudou a compra ou a margem -> a venda é recalculada automaticamente.
     Mudou a venda -> a margem se ajusta. Retorna (compra, margem, venda)."""
     novo = compra_ini is None  # produto novo: preço de compra e de venda começam VAZIOS
+    st.session_state[f"novo_{k}"] = novo
     if novo:
         st.session_state.setdefault(f"margem_{k}", MARGEM_PADRAO)
     elif f"compra_{k}" not in st.session_state:
@@ -1092,10 +1117,10 @@ def campos_preco(k, compra_ini, venda_ini):
     compra = c1.number_input("Preço de compra (R$)", min_value=0.0, step=0.5, format="%.2f",
                              key=f"compra_{k}", on_change=_recalcular_venda, args=(k,), **vazio)
     margem = c2.number_input("Margem de lucro (%)", min_value=0.0, max_value=1000.0, step=1.0,
-                             format="%.2f", key=f"margem_{k}", on_change=_recalcular_venda, args=(k,),
+                             format="%.2f", key=f"margem_{k}", on_change=_ao_mudar_margem, args=(k,),
                              help="Percentual somado ao preço de compra para calcular o preço de venda.")
     venda = c3.number_input("Preço de venda (R$)", min_value=0.0, step=0.5, format="%.2f",
-                            key=f"venda_{k}", on_change=_recalcular_margem, args=(k,),
+                            key=f"venda_{k}", on_change=_ao_mudar_venda, args=(k,),
                             help="Calculado automaticamente (compra + margem). Se você digitar um valor, a margem se ajusta.",
                             **vazio)
     if compra is not None and venda is not None and venda < compra:
@@ -1116,7 +1141,7 @@ with aba_produtos:
     st.caption("Campos com * são obrigatórios. Não são aceitos nomes repetidos.")
 
     with st.expander("Validador de NCM"):
-        ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste")
+        ncm_teste = st.text_input("Digite um NCM para conferir", key="ncm_teste", autocomplete="off")
         if ncm_teste.strip():
             ok_ncm, msg_ncm, desc_ncm = validar_ncm(ncm_teste)
             if ok_ncm:
@@ -1128,13 +1153,13 @@ with aba_produtos:
 
     # O número muda após cada cadastro, o que recria os campos limpos
     kc = f"cad{st.session_state.get('cad_n', 0)}"
-    nome = st.text_input("Nome do produto *", key=f"nome_{kc}")
+    nome = st.text_input("Nome do produto *", key=f"nome_{kc}", autocomplete="off")
     compra, margem, venda = campos_preco(kc, None, None)
     quantidade = st.number_input("Quantidade inicial *", min_value=1, value=None, step=1, key=f"qtd_{kc}")
-    ncm = st.text_input("NCM *", max_chars=10, key=f"ncm_{kc}",
+    ncm = st.text_input("NCM *", max_chars=10, key=f"ncm_{kc}", autocomplete="off",
                         help="Obrigatório. Somente números: 8 dígitos, com ou sem pontos.")
     cl, cf, cv = st.columns(3)
-    lote = cl.text_input("Lote (somente números)", key=f"lote_{kc}")
+    lote = cl.text_input("Lote (somente números)", key=f"lote_{kc}", autocomplete="off")
     fabricacao = cf.date_input("Fabricação", value=None, min_value=LIMITE_MIN, max_value=date.today(),
                                format="DD/MM/YYYY", key=f"fab_{kc}")
     validade = cv.date_input("Validade", value=None, min_value=LIMITE_MIN, max_value=LIMITE_MAX,
@@ -1144,6 +1169,7 @@ with aba_produtos:
     aviso_numerico(lote, "lote")
     if st.button("Cadastrar produto", type="primary", key=f"cadastrar_{kc}"):
         erro = None if nome.strip() else "Informe o nome do produto."
+        erro = erro or (None if st.session_state.get(f"compra_{kc}") is not None else "Informe o preço de compra.")
         erro = erro or (None if quantidade and quantidade >= 1 else "Informe a quantidade inicial (mínimo 1).")
         erro = erro or validar_campos_produto(ncm, fabricacao, validade, lote)
         if not erro:
@@ -1171,13 +1197,14 @@ with aba_produtos:
         # e uma tela desatualizada nunca sobrescreve o estoque.
         ke = f"ed{produto_id}_{qtd_atual}"
 
-        nome_editado = st.text_input("Nome *", value=str(linha["nome"]), key=f"nome_{ke}")
+        nome_editado = st.text_input("Nome *", value=str(linha["nome"]), key=f"nome_{ke}", autocomplete="off")
         preco_editado, _, venda_editada = campos_preco(ke, linha["preco"], linha["preco_venda"])
         quantidade_editada = st.number_input("Quantidade *", min_value=0, value=qtd_atual, step=1, key=f"qtd_{ke}")
-        ncm_editado = st.text_input("NCM *", value=formatar_ncm(linha["ncm"]), max_chars=10, key=f"ncm_{ke}")
+        ncm_editado = st.text_input("NCM *", value=formatar_ncm(linha["ncm"]), max_chars=10, key=f"ncm_{ke}", autocomplete="off")
         cl, cf, cv = st.columns(3)
         lote_editado = cl.text_input(
-            "Lote (somente números)", value="" if pd.isna(linha["lote"]) else str(linha["lote"]), key=f"lote_{ke}")
+            "Lote (somente números)", value="" if pd.isna(linha["lote"]) else str(linha["lote"]), key=f"lote_{ke}",
+            autocomplete="off")
         fab_editada = cf.date_input(
             "Fabricação", value=para_data(linha["fabricacao"]), min_value=LIMITE_MIN,
             max_value=date.today(), format="DD/MM/YYYY", key=f"fab_{ke}")
@@ -1279,7 +1306,7 @@ with aba_consulta:
         sem_ncm = int((todos["ncm"].fillna("") == "").sum())
         if sem_ncm:
             st.warning(f"{sem_ncm} produto(s) antigo(s) sem NCM. Edite-os na aba Produtos para completar o cadastro.")
-        busca = st.text_input("Buscar por nome, lote ou NCM")
+        busca = st.text_input("Buscar por nome, lote ou NCM", autocomplete="off")
         lista = todos
         if busca.strip():
             termo = busca.strip()
@@ -1345,8 +1372,8 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
         
         with tab_criar:
             with st.form("form_novo_usuario"):
-                novo_login = st.text_input("Login do novo usuário")
-                nova_senha = st.text_input("Senha inicial", type="password")
+                novo_login = st.text_input("Login do novo usuário", autocomplete="off")
+                nova_senha = st.text_input("Senha inicial", type="password", autocomplete="new-password")
                 novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"], index=0)
                 btn_criar = st.form_submit_button("Cadastrar Usuário", type="primary")
                 
@@ -1408,6 +1435,24 @@ try:
     import streamlit.components.v1 as components
     components.html("""<script>
     const doc = window.parent.document;
+    // Desliga o autopreenchimento do navegador em todos os campos que ainda não definiram
+    // o atributo (números, datas, caixas de seleção). Campos de login e senha já vêm definidos.
+    if (!doc.__sfAutocomplete) {
+      doc.__sfAutocomplete = true;
+      const desligar = () => {
+        doc.querySelectorAll('.stApp input').forEach((el) => {
+          const atual = el.getAttribute('autocomplete');
+          if (!atual) el.setAttribute('autocomplete', 'off');
+        });
+      };
+      let agendado = false;
+      new MutationObserver(() => {
+        if (agendado) return;
+        agendado = true;
+        requestAnimationFrame(() => { agendado = false; desligar(); });
+      }).observe(doc.body, { childList: true, subtree: true });
+      desligar();
+    }
     if (!doc.__sfSelecionar) {
       doc.__sfSelecionar = true;
       doc.addEventListener('focusin', (e) => {
