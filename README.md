@@ -9,7 +9,6 @@ O objetivo é permitir o cadastro e a consulta de produtos, o controle de entrad
 O sistema também possui controle de acesso por usuários, com permissões diferentes para administradores e funcionários.
 
 ---
-
 ## Objetivos
 
 - Desenvolver um sistema simples para gerenciamento de estoque;
@@ -18,7 +17,6 @@ O sistema também possui controle de acesso por usuários, com permissões difer
 - Acompanhar a quantidade disponível de cada produto;
 - Implementar controle de acesso por perfil de usuário;
 - Armazenar os dados em um banco de dados SQLite.
-
 ---
 
 ## Funcionalidades
