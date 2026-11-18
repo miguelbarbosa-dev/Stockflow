@@ -1367,14 +1367,23 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
     with aba_usuarios[0]:
         st.subheader("🛡️ Gerenciamento de Usuários e Privilégios")
         st.info("Apenas administradores têm acesso a esta aba.")
-        
+
+        # A mensagem é guardada antes do st.rerun() e mostrada aqui, senão ela some junto com a tela
+        aviso_usuario = st.session_state.pop("aviso_usuario", None)
+        if aviso_usuario:
+            st.success(aviso_usuario)
+
         tab_criar, tab_gerenciar = st.tabs(["Cadastrar Novo Usuário", "Alterar Privilégios / Excluir"])
         
         with tab_criar:
-            with st.form("form_novo_usuario"):
-                novo_login = st.text_input("Login do novo usuário", autocomplete="off")
-                nova_senha = st.text_input("Senha inicial", type="password", autocomplete="new-password")
-                novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"], index=0)
+            # O número muda após cada cadastro, o que recria o formulário com os campos limpos
+            ku = f"usr{st.session_state.get('usr_n', 0)}"
+            with st.form(f"form_novo_usuario_{ku}"):
+                novo_login = st.text_input("Login do novo usuário", autocomplete="off", key=f"login_{ku}")
+                nova_senha = st.text_input("Senha inicial", type="password", autocomplete="new-password",
+                                           key=f"senha_{ku}")
+                novo_perfil = st.selectbox("Perfil de acesso", ["funcionario", "admin"], index=0,
+                                           key=f"perfil_{ku}")
                 btn_criar = st.form_submit_button("Cadastrar Usuário", type="primary")
                 
                 if btn_criar:
@@ -1383,7 +1392,8 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                     else:
                         sucesso, msg = adicionar_usuario(novo_login, nova_senha, novo_perfil)
                         if sucesso:
-                            st.success(msg)
+                            st.session_state["aviso_usuario"] = msg
+                            st.session_state["usr_n"] = st.session_state.get("usr_n", 0) + 1
                             st.rerun()
                         else:
                             st.error(msg)
@@ -1401,7 +1411,8 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                     f'{row["login"]} (Perfil: {row["perfil"]})': int(row["id"])
                     for _, row in usuarios_df.iterrows()
                 }
-                usuario_selecionado_nome = st.selectbox("Selecione o usuário", list(opcoes_usuarios.keys()))
+                usuario_selecionado_nome = st.selectbox("Selecione o usuário", list(opcoes_usuarios.keys()),
+                                                        key="usuario_gerenciar")
                 usuario_id = opcoes_usuarios[usuario_selecionado_nome]
                 
                 col1, col2 = st.columns(2)
@@ -1412,8 +1423,10 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                         if novo_perfil_select != perfil_atual:
                             sucesso, msg = alterar_perfil_usuario(usuario_id, novo_perfil_select)
                             if sucesso:
-                                st.success(msg)
+                                st.session_state["aviso_usuario"] = msg
                                 st.rerun()
+                            else:
+                                st.error(msg)
                         else:
                             st.info("O usuário já possui este perfil.")
 
@@ -1425,7 +1438,7 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                         
                         sucesso, msg = excluir_usuario(usuario_id, usuario_logado_id)
                         if sucesso:
-                            st.success(msg)
+                            st.session_state["aviso_usuario"] = msg
                             st.rerun()
                         else:
                             st.error(msg)
