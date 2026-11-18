@@ -142,8 +142,6 @@ StockFlow/
 ├── StockFlow.py       # Aplicação principal
 ├── estoque.db         # Banco de dados (criado automaticamente)
 ├── backups/           # Backups automáticos
-├── ncm_tabela.csv     # Tabela de NCM (opcional)
-└── ncm_tabela.json    # Tabela de NCM (opcional)
 ```
 
 O arquivo `estoque.db` e a pasta `backups/` são gerados automaticamente durante a utilização do sistema.
