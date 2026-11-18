@@ -77,6 +77,44 @@ def verificar_senha(senha, salt, hash_armazenado):
     return hmac.compare_digest(hash_digitado, hash_armazenado)
 
 
+TABELAS_ID = ("produtos", "movimentacoes", "usuarios")
+
+
+def _reiniciar_contador(conn, tabela):
+    """O próximo ID passa a ser (maior ID que existe + 1). Com a tabela vazia, volta a ser 1.
+    Sem isso o SQLite continua contando a partir do último ID já usado, mesmo após exclusões."""
+    assert tabela in TABELAS_ID
+    conn.execute(
+        f"UPDATE sqlite_sequence SET seq = (SELECT COALESCE(MAX(id), 0) FROM {tabela}) WHERE name = ?",
+        (tabela,))
+
+
+def reorganizar_ids():
+    """Renumera os IDs em sequência (1, 2, 3...) mantendo a ordem atual.
+    As movimentações continuam ligadas ao produto certo. Retorna quantos IDs mudaram."""
+    with conectar() as conn:
+        def renumerar(tabela, vinculos=()):
+            antigos = [linha[0] for linha in conn.execute(f"SELECT id FROM {tabela} ORDER BY id")]
+            mapa = {a: n for n, a in enumerate(antigos, start=1) if a != n}
+            for a in mapa:  # 1) vai para IDs temporários negativos (evita choque entre números)
+                conn.execute(f"UPDATE {tabela} SET id = ? WHERE id = ?", (-a, a))
+                for t, c in vinculos:
+                    conn.execute(f"UPDATE {t} SET {c} = ? WHERE {c} = ?", (-a, a))
+            for a, n in mapa.items():  # 2) recebe o número final
+                conn.execute(f"UPDATE {tabela} SET id = ? WHERE id = ?", (n, -a))
+                for t, c in vinculos:
+                    conn.execute(f"UPDATE {t} SET {c} = ? WHERE {c} = ?", (n, -a))
+            return len(mapa)
+
+        alterados = (renumerar("produtos", [("movimentacoes", "produto_id")])
+                     + renumerar("movimentacoes") + renumerar("usuarios"))
+        for tabela in TABELAS_ID:
+            _reiniciar_contador(conn, tabela)
+    _limpar_cache_estoque()
+    listar_usuarios.clear()
+    return alterados
+
+
 def criar_tabela():
     with conectar() as conn:
         conn.execute("PRAGMA journal_mode=WAL")  # leituras e escritas não se bloqueiam
@@ -150,6 +188,10 @@ def criar_tabela():
                 "INSERT INTO usuarios (login, salt, senha_hash, perfil, criado_em) VALUES (?, ?, ?, ?, ?)",
                 (USUARIO_INICIAL, salt, senha_hash, 'admin', agora()),
             )
+
+        # Corrige contadores de ID adiantados por exclusões anteriores
+        for tabela in TABELAS_ID:
+            _reiniciar_contador(conn, tabela)
 
 
 def fazer_backup(destino=None):
@@ -299,7 +341,17 @@ def validar_campos_produto(ncm, fabricacao, validade, lote=""):
 
 
 def _formatar_datas(serie):
+    if serie.empty:
+        return pd.Series(dtype="object", index=serie.index)
     return pd.to_datetime(serie, errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
+
+
+def calcular_dias_validade(serie):
+    """Dias até a validade (negativo = já venceu). Fica vazio (NaN) quando não há validade."""
+    if serie.empty:
+        return pd.Series(dtype="float64", index=serie.index)
+    datas = pd.to_datetime(serie, errors="coerce")
+    return (datas - pd.Timestamp(date.today())).dt.days
 
 
 def rotulo_validade(dias):
@@ -310,6 +362,50 @@ def rotulo_validade(dias):
     if dias == 0:
         return "Vence hoje"
     return f"Vence em {int(dias)} dia(s)"
+
+
+def tabela_resumo(df):
+    """Tabela enxuta usada nos alertas de estoque baixo e de validade."""
+    return pd.DataFrame({
+        "ID": df["id"],
+        "Produto": df["nome"],
+        "Lote": df["lote"].fillna(""),
+        "Quantidade": df["quantidade"],
+        "Validade": _formatar_datas(df["validade"]),
+        "Situação": calcular_dias_validade(df["validade"]).map(rotulo_validade),
+    })
+
+
+def tabela_consulta(df):
+    """Tabela completa de produtos (com margem, datas e situação da validade)."""
+    compra, venda = df["preco"], df["preco_venda"]
+    return pd.DataFrame({
+        "ID": df["id"],
+        "Produto": df["nome"],
+        "Preço de compra": compra,
+        "Margem (%)": ((venda / compra - 1) * 100).where(compra > 0).round(2),
+        "Preço de venda": venda,
+        "Quantidade": df["quantidade"],
+        "NCM": df["ncm"].map(formatar_ncm),
+        "Lote": df["lote"].fillna(""),
+        "Fabricação": _formatar_datas(df["fabricacao"]),
+        "Validade": _formatar_datas(df["validade"]),
+        "Situação": calcular_dias_validade(df["validade"]).map(rotulo_validade),
+    })
+
+
+def estoque_baixo(produtos, limite):
+    """Produtos com quantidade até o limite, dos mais baixos para os mais altos."""
+    baixo = produtos[produtos["quantidade"] <= limite].sort_values(["quantidade", "nome"])
+    return tabela_resumo(baixo)
+
+
+def alertas_validade(produtos, dias_alerta):
+    """Retorna (vencidos, a_vencer, quantos_tem_validade); os mais urgentes primeiro."""
+    dias = calcular_dias_validade(produtos["validade"])
+    vencidos = produtos[dias < 0].sort_values("validade")
+    a_vencer = produtos[(dias >= 0) & (dias <= dias_alerta)].sort_values("validade")
+    return tabela_resumo(vencidos), tabela_resumo(a_vencer), int(dias.notna().sum())
 
 
 # ---------------------------------------------------------------------
@@ -334,9 +430,9 @@ def listar_produtos():
 def listar_historico():
     with conectar() as conn:
         return pd.read_sql_query("""
-            SELECT m.id, p.nome AS produto, p.lote, m.tipo, m.quantidade, m.data
+            SELECT m.id, COALESCE(p.nome, '(produto excluído)') AS produto, p.lote, m.tipo, m.quantidade, m.data
             FROM movimentacoes m
-            JOIN produtos p ON p.id = m.produto_id
+            LEFT JOIN produtos p ON p.id = m.produto_id
             ORDER BY m.id DESC
             LIMIT 100
         """, conn)
@@ -414,20 +510,32 @@ def editar_produto(produto_id, nome, preco, quantidade, ncm="", lote="", fabrica
     return True, "Produto atualizado."
 
 
-def excluir_produto(produto_id):
+def contar_movimentacoes(produto_id):
     with conectar() as conn:
-        existe_movimentacao = conn.execute(
-            "SELECT 1 FROM movimentacoes WHERE produto_id = ? LIMIT 1", (int(produto_id),)
-        ).fetchone()
-        if existe_movimentacao:
-            return False, "Não é possível excluir: este produto já possui movimentações registradas."
-        conn.execute("DELETE FROM produtos WHERE id = ?", (int(produto_id),))
+        return conn.execute(
+            "SELECT COUNT(*) FROM movimentacoes WHERE produto_id = ?", (int(produto_id),)
+        ).fetchone()[0]
+
+
+def excluir_produto(produto_id):
+    """Exclui o produto e, junto, as movimentações dele (tudo na mesma transação)."""
+    produto_id = int(produto_id)
+    with conectar() as conn:
+        if conn.execute("SELECT 1 FROM produtos WHERE id = ?", (produto_id,)).fetchone() is None:
+            return False, "Produto não encontrado."
+        removidas = conn.execute("DELETE FROM movimentacoes WHERE produto_id = ?", (produto_id,)).rowcount
+        conn.execute("DELETE FROM produtos WHERE id = ?", (produto_id,))
+        _reiniciar_contador(conn, "produtos")
+        _reiniciar_contador(conn, "movimentacoes")
     _limpar_cache_estoque()
-    return True, "Produto excluído com sucesso."
+    extra = f" {removidas} movimentação(ões) excluída(s) junto." if removidas else ""
+    return True, "Produto excluído com sucesso." + extra
 
 
 def movimentar_estoque(produto_id, tipo, quantidade):
     quantidade, produto_id = int(quantidade), int(produto_id)
+    if tipo not in ("Entrada", "Saída"):
+        return False, "Tipo de movimentação inválido."
     if quantidade <= 0:
         return False, "A quantidade deve ser maior que zero."
 
@@ -447,12 +555,13 @@ def movimentar_estoque(produto_id, tipo, quantidade):
             if produto is None:
                 return False, "Produto não encontrado."
             return False, f"Estoque insuficiente. Disponível: {int(produto[0])}."
+        atual = conn.execute("SELECT quantidade FROM produtos WHERE id = ?", (produto_id,)).fetchone()[0]
         conn.execute(
             "INSERT INTO movimentacoes (produto_id, tipo, quantidade, data) VALUES (?, ?, ?, ?)",
             (produto_id, tipo, quantidade, agora())
         )
     _limpar_cache_estoque()
-    return True, f"{tipo} registrada com sucesso."
+    return True, f"{tipo} de {quantidade} unidade(s) registrada. Estoque atual: {atual}."
 
 
 # --- Funções de Gerenciamento de Usuários (Apenas Admin) ---
@@ -504,6 +613,7 @@ def excluir_usuario(usuario_id, usuario_logado_id):
             return False, "Não é possível excluir o último administrador do sistema."
 
         conn.execute("DELETE FROM usuarios WHERE id = ?", (int(usuario_id),))
+        _reiniciar_contador(conn, "usuarios")
     listar_usuarios.clear()
     return True, "Usuário excluído com sucesso."
 
@@ -892,6 +1002,15 @@ with st.sidebar:
                     "Baixar backup", st.session_state["backup_bytes"],
                     file_name=f"estoque_{datetime.now():%Y%m%d_%H%M}.db",
                     mime="application/octet-stream", use_container_width=True)
+            st.caption("IDs com falhas (por exemplo, ID 5 com apenas um registro)? Reorganize para 1, 2, 3...")
+            confirma_ids = st.checkbox("Entendo que os IDs serão renumerados", key="confirma_reorganizar")
+            if st.button("Reorganizar IDs", use_container_width=True, key="reorganizar_ids", disabled=not confirma_ids):
+                alterados = reorganizar_ids()
+                for chave in ("produto_editar", "mov_produto", "confirma_reorganizar"):
+                    st.session_state.pop(chave, None)  # seleções antigas apontavam para IDs que mudaram
+                st.session_state["aviso_produto"] = (
+                    f"IDs reorganizados ({alterados} alterado(s))." if alterados else "Os IDs já estavam em sequência.")
+                st.rerun()
     st.divider()
     if st.button("Sair", use_container_width=True, type="secondary"):
         st.session_state["autenticado"] = False
@@ -1085,10 +1204,16 @@ with aba_produtos:
 
         # RESTRIÇÃO DE EXCLUSÃO: Apenas Admin
         if st.session_state.get("perfil") == "admin":
-            if st.button("🗑️ Excluir produto selecionado", key="excluir_produto", type="secondary"):
+            qtd_movs = contar_movimentacoes(produto_id)
+            if qtd_movs:
+                st.warning(f"Este produto tem {qtd_movs} movimentação(ões) registrada(s). "
+                           "Ao excluí-lo, elas também serão excluídas.")
+            confirmou = st.checkbox("Confirmo a exclusão deste produto", key=f"confirma_exclusao_{produto_id}")
+            if st.button("🗑️ Excluir produto selecionado", key="excluir_produto", type="secondary",
+                         disabled=not confirmou):
                 sucesso, msg = excluir_produto(produto_id)
                 if sucesso:
-                    st.success(msg)
+                    st.session_state["aviso_produto"] = msg
                     st.rerun()
                 else:
                     st.error(msg)
@@ -1097,32 +1222,38 @@ with aba_produtos:
 
 # --- ABA MOVIMENTAÇÕES ---
 with aba_movimentacoes:
+    aviso = st.session_state.pop("aviso_mov", None)
+    if aviso:
+        st.success(aviso)
+
     st.subheader("Registrar entrada ou saída")
     produtos = listar_produtos()
     if produtos.empty:
         st.info("Cadastre um produto antes de registrar movimentações.")
     else:
-        opcoes_mov = {}
+        # As opções são os IDs (não mudam); o texto mostrado traz o estoque atual.
+        # Assim a escolha do produto não "pula" para o primeiro depois de cada movimentação.
+        rotulos = {}
         for i, n, q, lt in zip(produtos["id"], produtos["nome"], produtos["quantidade"], produtos["lote"]):
-            rotulo = f"{n}{'' if pd.isna(lt) or not lt else f' · Lote {lt}'} (estoque: {int(q)})"
-            if rotulo in opcoes_mov:  # nomes repetidos não podem se sobrepor
-                rotulo += f" [ID {i}]"
-            opcoes_mov[rotulo] = int(i)
-        with st.form("form_movimentacao"):
-            escolha = st.selectbox("Produto", list(opcoes_mov.keys()))
-            tipo = st.radio("Tipo de movimentação", ["Entrada", "Saída"], horizontal=True)
-            qtd_mov = st.number_input("Quantidade", min_value=1, value=None, step=1)
-            registrar = st.form_submit_button("Registrar movimentação", type="primary")
-            if registrar:
-                if not qtd_mov:
-                    st.error("Informe a quantidade.")
+            lote_txt = "" if pd.isna(lt) or not lt else f" · Lote {lt}"
+            rotulos[int(i)] = f"{n}{lote_txt} (estoque: {int(q)})"
+        km = f"mov{st.session_state.get('mov_n', 0)}"  # muda após cada registro e limpa os campos
+
+        produto_mov = st.selectbox("Produto", list(rotulos.keys()), format_func=lambda i: rotulos[i], key="mov_produto")
+        tipo = st.radio("Tipo de movimentação", ["Entrada", "Saída"], horizontal=True, key=f"tipo_{km}")
+        qtd_mov = st.number_input("Quantidade", min_value=1, value=None, step=1, key=f"qtd_{km}")
+
+        if st.button("Registrar movimentação", type="primary", key=f"registrar_{km}"):
+            if not qtd_mov:
+                st.error("Informe a quantidade.")
+            else:
+                sucesso, mensagem = movimentar_estoque(produto_mov, tipo, int(qtd_mov))
+                if sucesso:
+                    st.session_state["aviso_mov"] = mensagem
+                    st.session_state["mov_n"] = st.session_state.get("mov_n", 0) + 1
+                    st.rerun()
                 else:
-                    sucesso, mensagem = movimentar_estoque(opcoes_mov[escolha], tipo, qtd_mov)
-                    if sucesso:
-                        st.success(mensagem)
-                        st.rerun()
-                    else:
-                        st.error(mensagem)
+                    st.error(mensagem)
 
     st.divider()
     st.subheader("Histórico de movimentações")
@@ -1130,73 +1261,69 @@ with aba_movimentacoes:
     if historico.empty:
         st.info("Nenhuma movimentação registrada.")
     else:
-        st.dataframe(historico.fillna(""), use_container_width=True, hide_index=True)
+        st.dataframe(
+            historico.fillna("").rename(columns={
+                "id": "ID", "produto": "Produto", "lote": "Lote", "tipo": "Tipo",
+                "quantidade": "Quantidade", "data": "Data e hora"}),
+            use_container_width=True, hide_index=True)
 
 # --- ABA CONSULTA ---
 with aba_consulta:
+    # Os alertas (estoque baixo e validade) olham SEMPRE para todos os produtos;
+    # a busca afeta apenas a tabela de produtos.
+    todos = listar_produtos()
     st.subheader("Produtos cadastrados")
-    produtos = listar_produtos()
-    if produtos.empty:
+    if todos.empty:
         st.info("Nenhum produto cadastrado.")
     else:
-        sem_ncm = int((produtos["ncm"].fillna("") == "").sum())
+        sem_ncm = int((todos["ncm"].fillna("") == "").sum())
         if sem_ncm:
             st.warning(f"{sem_ncm} produto(s) antigo(s) sem NCM. Edite-os na aba Produtos para completar o cadastro.")
         busca = st.text_input("Buscar por nome, lote ou NCM")
+        lista = todos
         if busca.strip():
             termo = busca.strip()
             termo_ncm = normalizar_ncm(termo)
             mascara = (
-                produtos["nome"].str.contains(termo, case=False, na=False, regex=False)
-                | produtos["lote"].fillna("").str.contains(termo, case=False, regex=False)
+                todos["nome"].str.contains(termo, case=False, na=False, regex=False)
+                | todos["lote"].fillna("").str.contains(termo, case=False, regex=False)
             )
             if termo_ncm:
-                mascara |= produtos["ncm"].fillna("").str.contains(termo_ncm, regex=False)
-            produtos = produtos[mascara]
+                mascara |= todos["ncm"].fillna("").str.contains(termo_ncm, regex=False)
+            lista = todos[mascara]
 
-        dias = (pd.to_datetime(produtos["validade"], errors="coerce")
-                - pd.Timestamp(date.today())).dt.days
-        produtos_display = pd.DataFrame({
-            "ID": produtos["id"],
-            "Produto": produtos["nome"],
-            "Preço de compra": produtos["preco"],
-            "Margem (%)": ((produtos["preco_venda"] / produtos["preco"] - 1) * 100).where(produtos["preco"] > 0).round(2),
-            "Preço de venda": produtos["preco_venda"],
-            "Quantidade": produtos["quantidade"],
-            "NCM": produtos["ncm"].map(formatar_ncm),
-            "Lote": produtos["lote"].fillna(""),
-            "Fabricação": _formatar_datas(produtos["fabricacao"]),
-            "Validade": _formatar_datas(produtos["validade"]),
-            "Situação": dias.map(rotulo_validade),
-        })
-        st.dataframe(
-            produtos_display,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Preço de compra": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Preço de venda": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Margem (%)": st.column_config.NumberColumn(format="%.2f"),
-                "Quantidade": st.column_config.NumberColumn(format="%d")
-            }
-        )
+        if lista.empty:
+            st.info("Nenhum produto encontrado para essa busca.")
+        else:
+            st.dataframe(
+                tabela_consulta(lista),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Preço de compra": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Preço de venda": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Margem (%)": st.column_config.NumberColumn(format="%.2f"),
+                    "Quantidade": st.column_config.NumberColumn(format="%d"),
+                }
+            )
 
         st.divider()
         st.subheader("Estoque baixo")
-        limite = st.number_input("Considerar estoque baixo quando houver até", min_value=0, value=5, step=1)
-        estoque_baixo = produtos_display[produtos_display["Quantidade"] <= limite]
-        if estoque_baixo.empty:
+        limite = st.number_input("Considerar estoque baixo quando houver até (unidades)",
+                                 min_value=0, value=5, step=1, key="limite_baixo")
+        baixo = estoque_baixo(todos, limite)
+        if baixo.empty:
             st.success("Nenhum produto abaixo do limite escolhido.")
         else:
-            st.warning(f"{len(estoque_baixo)} produto(s) com estoque baixo.")
-            st.dataframe(estoque_baixo, use_container_width=True, hide_index=True)
+            st.warning(f"{len(baixo)} produto(s) com estoque baixo.")
+            st.dataframe(baixo, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("Validade")
-        alerta = st.number_input("Alertar produtos que vencem em até (dias)", min_value=0, value=30, step=1)
-        vencidos = produtos_display[dias < 0]
-        a_vencer = produtos_display[(dias >= 0) & (dias <= alerta)]
-        if dias.notna().sum() == 0:
+        alerta = st.number_input("Alertar produtos que vencem em até (dias)",
+                                 min_value=0, value=30, step=1, key="dias_alerta")
+        vencidos, a_vencer, com_validade = alertas_validade(todos, alerta)
+        if com_validade == 0:
             st.info("Nenhum produto com data de validade informada.")
         elif vencidos.empty and a_vencer.empty:
             st.success("Nenhum produto vencido ou próximo do vencimento.")
@@ -1275,6 +1402,7 @@ if st.session_state.get("perfil") == "admin" and aba_usuarios:
                             st.rerun()
                         else:
                             st.error(msg)
+
 
 try:
     import streamlit.components.v1 as components
